@@ -11,19 +11,6 @@ static ArduinoFFT<double> FFT(vReal, vImag, FFT_SIZE, SAMPLE_RATE);
 
 float bandMagnitude[NUM_BANDS] = {0};
 
-/*
-Band	Frequency Range	What Lives Here
-1	20 – 60 Hz	Sub-bass rumble, kick thump
-2	60 – 120 Hz	Bass guitar body
-3	120 – 250 Hz	Low mids, warmth
-4	250 – 500 Hz	Vocal fullness
-5	500 Hz – 1 kHz	Vocal clarity
-6	1 – 2 kHz	Presence, speech
-7	2 – 6 kHz	Attack, snare crack
-8	6 – 16 kHz	Air, sparkle, hiss
-*/
-
-
 // ─── Perceptual Band Bin Ranges ───────────────────────────────────────────────
 // Bin = frequency / (SAMPLE_RATE / FFT_SIZE) = frequency / 31.25
 // Limits below are [startBin, endBin) inclusive of start, exclusive of end.
@@ -50,34 +37,42 @@ static const uint16_t bandBinEnd[NUM_BANDS] = {
 
 // ─── Peak tracking for normalisation ─────────────────────────────────────────
 static float peakHold[NUM_BANDS];
-//#define PEAK_DECAY   0.94f   // Slowly drop peak envelope
+#define PEAK_DECAY  0.998f   // Slower decay — prevents AGC pumping on transients
 
-// Per-band noise gates — low bands need much higher gates than high bands.
-// Tune each value independently until that band goes dark in silence.
-static const float noiseFl[NUM_BANDS] = {
-    10000.0f,  // Band 0: sub-bass  — nearly unusable, gate hard (was 2400)
-    8000.0f,  // Band 1: bass      — marginal, gate hard  (was 2100)
-    1500.0f,  // Band 2: low-mid
-    580.0f,  // Band 3: mid
-    490.0f,  // Band 4: upper-mid
-    730.0f,  // Band 5: presence
-    810.0f,  // Band 6: brilliance (was 170)
-    840.0f,  // Band 7: air (was 160)
-};
-// Higher value = less sensitive (bars sit lower).
-// Lower value = more sensitive (bars reach top more easily).
-// Tune by playing music and adjusting each band until the display looks balanced.
-static const float sensitivity[NUM_BANDS] = {
-    30000.0f,  // Band 0: small range above gate, will rarely trigger
-    26500.0f,  // Band 1: B1 peaked at ~3600, gate at 1200, range = 2400
-    10500.0f,  // Band 2: B2 peaked at ~3400, gate at 450, range = 3000
-    8000.0f,  // Band 3: B3 peaked at 12151, gate at 280, range ~12000
-    5100.0f,  // Band 4: B4 peaked at 20364, gate at 160, range ~20000
-    4600.0f,  // Band 5: small range, keep sensitive
-    900.0f,  // Band 6: very small range
-    900.0f,  // Band 7: very small range
+// Per-band noise floor: measured in silence, max observed x 2.0 safety margin.
+// Any band average below this value is clamped to zero before normalisation.
+static const float NOISE_FLOOR[NUM_BANDS] = {
+    16800.0f,  // B0  sub-bass   — high EMI / board pickup
+    15200.0f,  // B1  bass       — noisy
+    22500.0f,  // B2  low-mid    — noisiest, likely 60 Hz harmonic coupling
+     7700.0f,  // B3  mid
+     2900.0f,  // B4  upper-mid  — clean, drops sharply here
+      870.0f,  // B5  presence
+      615.0f,  // B6  brilliance
+      515.0f,  // B7  air
 };
 
+// Per-band sensitivity multiplier applied after AGC normalisation.
+// The AGC produces 0.0-1.0 per band. This scales it before the renderer sees it,
+// clamped to 1.0 so bars never exceed full height.
+//
+// Why needed even with AGC:
+//   After noise floor subtraction, low bands have compressed headroom and the
+//   AGC takes time to re-calibrate after quiet passages. High bands carry less
+//   raw energy in typical music and would otherwise stay dim.
+//
+// 1.0 = neutral. Raise to make a band more responsive, lower to tame it.
+// Tune by ear with a track that has clear kick, snare, vocals, and hi-hats.
+static const float SENSITIVITY[NUM_BANDS] = {
+    1.0f,   // B0  sub-bass   — kick drum fills this naturally
+    1.0f,   // B1  bass
+    1.0f,   // B2  low-mid    — watch for false triggers if raised
+    1.2f,   // B3  mid        — slight boost, snare and vocals
+    1.4f,   // B4  upper-mid  — often under-represented
+    1.8f,   // B5  presence   — high freqs have less raw energy
+    2.0f,   // B6  brilliance
+    2.0f,   // B7  air        — nearly always dark without a boost
+};
 
 void fftInit() {
     memset(peakHold, 0, sizeof(peakHold));
@@ -101,52 +96,29 @@ void fftProcess() {
     FFT.complexToMagnitude(); // results in vReal[0..FFT_SIZE/2]
 
     // ── 4. Accumulate bands ───────────────────────────────────────────────────
-    static uint32_t lastPrint = 0;
-    bool doPrint = (millis() - lastPrint > 500); //remove comment to serial print values
-    //bool doPrint = false; //comment out to unblock serial print values
-
-    if (doPrint) lastPrint = millis();
-
     for (int b = 0; b < NUM_BANDS; b++) {
         double sum = 0.0;
         int count = 0;
         for (int k = bandBinStart[b]; k < bandBinEnd[b]; k++) {
             double mag = vReal[k];
-            if (mag > noiseFl[b]) {
+            if (mag > NOISE_FLOOR[b]) {
                 sum += mag;
                 count++;
             }
         }
-        float avg = (count > 0) ? (float)(sum / count) : 0.0f;
+        // Subtract noise floor so peakHold tracks only signal, not noise
+        float avg = (count > 0) ? fmaxf(0.0f, (float)(sum / count) - NOISE_FLOOR[b]) : 0.0f;
 
-        // ── Print RAW avg before any normalisation ────────────────────────────
-        if (doPrint) {
-            Serial.print("B"); Serial.print(b);
-            Serial.print("="); Serial.print(avg, 1);
-            Serial.print("  ");
-        }
+        // ── 5. Normalise against decaying peak ────────────────────────────────
+        peakHold[b] *= PEAK_DECAY;
+        if (avg > peakHold[b]) peakHold[b] = avg;
 
-        // ── Fixed scale normalisation ─────────────────────────────────────────
-        float normalised = avg / sensitivity[b];
-        if (normalised > 1.0f) normalised = 1.0f;
+        float normalised = (peakHold[b] > 0.0f) ? (avg / peakHold[b]) : 0.0f;
 
-        // ── IIR smoothing ─────────────────────────────────────────────────────
-        bandMagnitude[b] = bandMagnitude[b] * 0.3f + normalised * 0.7f;
+        // 6. Apply per-band sensitivity, clamp to 1.0
+        normalised = fminf(1.0f, normalised * SENSITIVITY[b]);
+
+        // ── 6. Smooth output (IIR low-pass) ───────────────────────────────────
+        bandMagnitude[b] = bandMagnitude[b] * 0.5f + normalised * 0.5f;
     }
-    if (doPrint) Serial.println();
-/*
-    // ── Diagnostic: print raw avg per band to Serial ──────────────────────
-    static uint32_t lastPrint = 0;
-    if (millis() - lastPrint > 500) {   // Print twice per second
-        lastPrint = millis();
-        for (int b = 0; b < NUM_BANDS; b++) {
-            Serial.print("B");
-            Serial.print(b);
-            Serial.print("=");
-            Serial.print(bandMagnitude[b] * sensitivity[b], 1); // Print raw avg
-            Serial.print("  ");
-        }
-        Serial.println();
-    }
-        */
 }

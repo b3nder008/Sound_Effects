@@ -38,7 +38,7 @@ static Adafruit_NeoMatrix matrix(
 );
 
 // ─── Global brightness ───────────────────────────────────────────────────────
-#define BRIGHTNESS  100   // base brightness 0–255
+#define BRIGHTNESS  50   // base brightness 0–255
 
 // ─── Beat detector ───────────────────────────────────────────────────────────
 // Shared by all modes. Outputs:
