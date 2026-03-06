@@ -38,7 +38,7 @@ static Adafruit_NeoMatrix matrix(
 );
 
 // ─── Global brightness ───────────────────────────────────────────────────────
-#define BRIGHTNESS  50   // base brightness 0–255
+#define BRIGHTNESS  100   // base brightness 0–255
 
 // ─── Beat detector ───────────────────────────────────────────────────────────
 // Shared by all modes. Outputs:
@@ -873,6 +873,218 @@ static void renderTwinkles() {
     flushLeds(_twLeds);
 }
 
+
+// =============================================================================
+// MODE_RAIN -- Falling rain streaks, grey-blue tones, ghost trails, lightning
+//
+// Architecture
+// ------------
+//   - Up to RAIN_MAX_STREAKS simultaneous streaks, one pool shared across all
+//     columns (multiple streaks can share a column, creating density variation).
+//   - Each streak has a head position (float 0=top .. MATRIX_ROWS-1=bottom),
+//     a speed, a lead brightness, and a per-streak blue tint amount.
+//   - A ghost buffer [col][row] (float 0-255) decays each frame independently.
+//     The streak head writes into it at full brightness; the buffer fades the
+//     trail behind it naturally.
+//   - Rainfall intensity is a slow sinusoidal oscillator cycling over
+//     RAIN_CYCLE_MS milliseconds.  Intensity drives spawn rate and speed range.
+//   - Lightning fires only when intensity > RAIN_LIGHTNING_THRESH.  A strike
+//     lasts RAIN_FLASH_FRAMES frames: the first frame is a full white bloom,
+//     subsequent frames invert the brightness of any ghost pixel that was lit
+//     at the moment of the strike (captured into a snapshot buffer).
+//   - Beat modulation: a detected beat can trigger an immediate lightning
+//     strike regardless of intensity, giving an audio-reactive flash.
+// =============================================================================
+#elif ACTIVE_MODE == MODE_RAIN
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+#define RAIN_MAX_STREAKS       12    // simultaneous falling streaks
+#define RAIN_TRAIL_DECAY     0.78f   // ghost brightness multiplier per frame
+                                     // lower = shorter trails, higher = longer
+#define RAIN_SPEED_LIGHT     0.35f   // head pixels/frame at zero intensity
+#define RAIN_SPEED_HEAVY     1.10f   // head pixels/frame at full intensity
+#define RAIN_SPAWN_LIGHT     0.04f   // probability per frame of new streak (light)
+#define RAIN_SPAWN_HEAVY     0.55f   // probability per frame of new streak (heavy)
+#define RAIN_CYCLE_MS       75000UL  // full light→heavy→light cycle length (ms)
+#define RAIN_LIGHTNING_THRESH 0.70f  // intensity level above which lightning fires
+#define RAIN_LIGHTNING_PROB  0.004f  // probability per frame of a lightning strike
+#define RAIN_FLASH_FRAMES       4    // frames a lightning event lasts
+#define RAIN_BLOOM_FRAMES       1    // first N frames = full white bloom
+
+// ── Streak ────────────────────────────────────────────────────────────────────
+struct RainStreak {
+    bool    active;
+    uint8_t col;
+    float   pos;       // 0.0 = top row, MATRIX_ROWS-1 = bottom row
+    float   speed;     // rows per frame
+    uint8_t headBri;   // lead pixel brightness 180-255
+    uint8_t blueTint;  // 0 = pure grey, 255 = full blue (kept subtle, 10-55)
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static RainStreak _rainStreaks[RAIN_MAX_STREAKS];
+static float      _rainGhost[MATRIX_COLS][MATRIX_ROWS];   // decay buffer
+static float      _rainSnap[MATRIX_COLS][MATRIX_ROWS];    // lightning snapshot
+static uint8_t    _rainFlashFrames = 0;   // countdown during lightning event
+static bool       _rainBeatFlash   = false;
+
+static float _rainIntensity() {
+    // Returns 0.0 (light drizzle) .. 1.0 (heavy downpour)
+    // Slow sine wave with a mild random wander component
+    uint32_t t = millis();
+    float phase = (float)(t % RAIN_CYCLE_MS) / (float)RAIN_CYCLE_MS;
+    // Primary: sin cycle. Secondary: offset sin at different phase/period
+    float primary   = 0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI);
+    float secondary = 0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI * 1.618f + 1.2f);
+    return 0.6f * primary + 0.4f * secondary;  // weighted blend, always 0..1
+}
+
+static void _rainSpawnStreak(float intensity) {
+    // Find a free slot
+    int slot = -1;
+    for (int i = 0; i < RAIN_MAX_STREAKS; i++) {
+        if (!_rainStreaks[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return;
+
+    RainStreak& s = _rainStreaks[slot];
+    s.active   = true;
+    s.col      = random8(MATRIX_COLS);
+    s.pos      = 0.0f;  // starts at top
+    // Speed: linear interpolation across intensity, plus small random variance
+    float baseSpeed = RAIN_SPEED_LIGHT + intensity * (RAIN_SPEED_HEAVY - RAIN_SPEED_LIGHT);
+    s.speed    = baseSpeed * (0.75f + 0.50f * ((float)random8() / 255.0f));
+    // Head brightness: heavier rain = brighter leads
+    s.headBri  = (uint8_t)(160.0f + intensity * 90.0f + random8(0, 20));
+    // Blue tint: very subtle, randomised per streak (10..55 range)
+    s.blueTint = 10 + random8(0, 45);
+}
+
+static void _rainTriggerLightning() {
+    // Snapshot current ghost buffer — these pixels will be inverted
+    memcpy(_rainSnap, _rainGhost, sizeof(_rainGhost));
+    _rainFlashFrames = RAIN_FLASH_FRAMES;
+}
+
+static void renderRain() {
+    float intensity = _rainIntensity();
+
+    // ── 1. Lightning: check for new strike ───────────────────────────────────
+    bool lightningNow = false;
+    if (_rainFlashFrames == 0) {
+        // Beat always triggers a strike (dramatic audio reaction)
+        if (beatFired) {
+            lightningNow = true;
+        }
+        // Spontaneous strike only during heavy rain
+        else if (intensity > RAIN_LIGHTNING_THRESH
+                 && (float)random8() / 255.0f < RAIN_LIGHTNING_PROB) {
+            lightningNow = true;
+        }
+        if (lightningNow) _rainTriggerLightning();
+    }
+
+    // ── 2. Spawn new streaks ──────────────────────────────────────────────────
+    float spawnProb = RAIN_SPAWN_LIGHT
+                    + intensity * (RAIN_SPAWN_HEAVY - RAIN_SPAWN_LIGHT);
+    if ((float)random8() / 255.0f < spawnProb) {
+        _rainSpawnStreak(intensity);
+    }
+
+    // ── 3. Decay all ghost trails ─────────────────────────────────────────────
+    for (int c = 0; c < MATRIX_COLS; c++)
+        for (int r = 0; r < MATRIX_ROWS; r++)
+            _rainGhost[c][r] *= RAIN_TRAIL_DECAY;
+
+    // ── 4. Advance streaks and stamp head into ghost buffer ───────────────────
+    for (int i = 0; i < RAIN_MAX_STREAKS; i++) {
+        RainStreak& s = _rainStreaks[i];
+        if (!s.active) continue;
+
+        s.pos += s.speed;
+
+        if (s.pos >= (float)MATRIX_ROWS) {
+            // Streak has fallen off the bottom — retire it
+            s.active = false;
+            continue;
+        }
+
+        // Stamp head at current position (integer row)
+        int row = (int)s.pos;
+        if (row >= 0 && row < MATRIX_ROWS) {
+            // Head pixel always at full lead brightness
+            _rainGhost[s.col][row] = fmaxf(_rainGhost[s.col][row],
+                                           (float)s.headBri);
+        }
+        // Fractional sub-pixel: slightly light the next row for smooth motion
+        float frac = s.pos - (float)row;
+        if (frac > 0.1f && row + 1 < MATRIX_ROWS) {
+            float tipBri = (float)s.headBri * frac * 0.6f;
+            _rainGhost[s.col][row + 1] = fmaxf(_rainGhost[s.col][row + 1], tipBri);
+        }
+    }
+
+    // ── 5. Render ─────────────────────────────────────────────────────────────
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+
+    if (_rainFlashFrames > 0) {
+        // ── Lightning frame ───────────────────────────────────────────────────
+        if (_rainFlashFrames > RAIN_FLASH_FRAMES - RAIN_BLOOM_FRAMES) {
+            // Bloom frame: entire matrix floods white
+            matrix.fillScreen(matrix.Color(255, 255, 255));
+            // Active raindrop positions glow electric blue during bloom
+            for (int c = 0; c < MATRIX_COLS; c++) {
+                for (int r = 0; r < MATRIX_ROWS; r++) {
+                    if (_rainSnap[c][r] > 30.0f) {
+                        matrix.drawPixel(c, DRAW_Y(r), matrix.Color(120, 180, 255));
+                    }
+                }
+            }
+        } else {
+            // Post-bloom frames: dark background, inverted raindrop brightness
+            // gives a negative/afterimage effect
+            for (int c = 0; c < MATRIX_COLS; c++) {
+                for (int r = 0; r < MATRIX_ROWS; r++) {
+                    float snap = _rainSnap[c][r];
+                    if (snap > 10.0f) {
+                        // Invert: bright pixels become dark, dark pixels glow
+                        uint8_t inv = 255 - (uint8_t)fminf(255.0f, snap);
+                        // Keep the blue tint in the inverted afterimage
+                        uint8_t g = (uint8_t)(inv * 0.88f);
+                        matrix.drawPixel(c, DRAW_Y(r), matrix.Color(g, g, inv));
+                    }
+                    // Also draw current live ghost underneath
+                    float gb = _rainGhost[c][r];
+                    if (gb > 6.0f && snap <= 10.0f) {
+                        uint8_t bri = (uint8_t)fminf(255.0f, gb);
+                        uint8_t g2  = (uint8_t)(bri * 0.88f);
+                        matrix.drawPixel(c, DRAW_Y(r), matrix.Color(g2, g2, bri));
+                    }
+                }
+            }
+        }
+        _rainFlashFrames--;
+
+    } else {
+        // ── Normal rain frame ─────────────────────────────────────────────────
+        for (int c = 0; c < MATRIX_COLS; c++) {
+            for (int r = 0; r < MATRIX_ROWS; r++) {
+                float gb = _rainGhost[c][r];
+                if (gb < 4.0f) continue;
+                uint8_t bri = (uint8_t)fminf(255.0f, gb);
+                // Grey-blue: reduce red and green channels slightly relative to blue
+                // Amount of blue shift varies with rain intensity: heavier = bluer
+                float blueBoost = 1.0f + intensity * 0.22f;
+                uint8_t r_ch = (uint8_t)(bri * 0.82f);
+                uint8_t g_ch = (uint8_t)(bri * 0.88f);
+                uint8_t b_ch = (uint8_t)fminf(255.0f, (float)bri * blueBoost);
+                matrix.drawPixel(c, DRAW_Y(r), matrix.Color(r_ch, g_ch, b_ch));
+            }
+        }
+    }
+}
+
 #endif // end of mode implementations
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -903,6 +1115,11 @@ void visualizerInit() {
 #elif ACTIVE_MODE == MODE_CLOUD_TWINKLES || ACTIVE_MODE == MODE_RAINBOW_TWINKLES
     memset(_twLeds,    0, sizeof(_twLeds));
     memset(_twDirFlags, 0, sizeof(_twDirFlags));
+#elif ACTIVE_MODE == MODE_RAIN
+    memset(_rainStreaks, 0, sizeof(_rainStreaks));
+    memset(_rainGhost,  0, sizeof(_rainGhost));
+    memset(_rainSnap,   0, sizeof(_rainSnap));
+    _rainFlashFrames = 0;
 #endif
 }
 
@@ -947,6 +1164,8 @@ void visualizerUpdate() {
 #elif ACTIVE_MODE == MODE_CLOUD_TWINKLES || \
       ACTIVE_MODE == MODE_RAINBOW_TWINKLES
     renderTwinkles();
+#elif ACTIVE_MODE == MODE_RAIN
+    renderRain();
 #endif
 
     matrix.show();

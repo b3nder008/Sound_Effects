@@ -26,7 +26,7 @@
 
 // Set to 1 to print band magnitudes over serial (only when monitor is open).
 // Set to 0 to compile out all serial code entirely.
-#define DEBUG_SERIAL  1
+#define DEBUG_SERIAL  0
 
 // Convenience macro — only calls Serial if a host is actually connected.
 // Safe to use anywhere; evaluates to nothing when DEBUG_SERIAL is 0.

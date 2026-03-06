@@ -34,6 +34,7 @@
  *   MODE_HUE_CYCLE         fill_solid with slowly cycling hue
  *   MODE_CLOUD_TWINKLES    colortwinkles — CloudColors palette
  *   MODE_RAINBOW_TWINKLES  colortwinkles — RainbowColors palette
+ *   MODE_RAIN              Falling rain streaks, grey-blue, ghost trails, lightning
  *
  * ══════════════════════════════════════════════════════════════════════════════
  * BEAT DETECTION
@@ -52,7 +53,7 @@
 #include <Adafruit_NeoMatrix.h>
 
 // ── Active mode — change this one line ───────────────────────────────────────
-#define ACTIVE_MODE  MODE_SPECTRUM
+#define ACTIVE_MODE  MODE_RAIN
 
 // ── Mode identifiers ─────────────────────────────────────────────────────────
 #define MODE_SPECTRUM              0
@@ -96,3 +97,4 @@
 // ── Public API ────────────────────────────────────────────────────────────────
 void visualizerInit();
 void visualizerUpdate();
+#define MODE_RAIN                 24
