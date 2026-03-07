@@ -36,6 +36,7 @@
  *   MODE_RAINBOW_TWINKLES  colortwinkles — RainbowColors palette
  *   MODE_RAIN              Falling rain streaks, grey-blue, ghost trails, lightning
  *   MODE_STARFIELD         Classic warp-speed starfield, accelerating outward from center
+ *   MODE_DUNE               Desert dune ridges, sand palette, slow S-curve morphing, dust twinkles
  *
  * ══════════════════════════════════════════════════════════════════════════════
  * BEAT DETECTION
@@ -54,7 +55,7 @@
 #include <Adafruit_NeoMatrix.h>
 
 // ── Active mode — change this one line ───────────────────────────────────────
-#define ACTIVE_MODE  MODE_STARFIELD
+#define ACTIVE_MODE  MODE_DUNE
 
 // ── Mode identifiers ─────────────────────────────────────────────────────────
 #define MODE_SPECTRUM              0
@@ -100,3 +101,4 @@ void visualizerInit();
 void visualizerUpdate();
 #define MODE_RAIN                 24
 #define MODE_STARFIELD            25
+#define MODE_DUNE                 26

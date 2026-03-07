@@ -1119,18 +1119,18 @@ static void renderRain() {
 #elif ACTIVE_MODE == MODE_STARFIELD
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
-#define STAR_COUNT          12    // number of simultaneous stars
+#define STAR_COUNT          18    // number of simultaneous stars
                                   // 8-12 = sparse, 18-24 = busy, 30+ = dense
-#define STAR_ACCEL        1.28f   // outward scale factor per frame
+#define STAR_ACCEL        1.18f   // outward scale factor per frame
                                   // 1.10 = gentle drift, 1.18 = warp, 1.28 = fast
-#define STAR_TRAIL_DECAY  0.65f   // brightness of each successive trail step
+#define STAR_TRAIL_DECAY  0.45f   // brightness of each successive trail step
                                   // 0.25 = short dim trail, 0.55 = long bright trail
-#define STAR_TRAIL_LEN       4    // number of trail positions stored per star
+#define STAR_TRAIL_LEN       3    // number of trail positions stored per star
                                   // 1 = single ghost pixel, 4 = visible streak
 #define STAR_COLOR_CHANCE    5    // % of stars that get a color tint (0-100)
-#define STAR_SPAWN_RADIUS  0.3f   // spawn within this radius of center (matrix half-width units)
+#define STAR_SPAWN_RADIUS  0.8f   // spawn within this radius of center (matrix half-width units)
                                   // 0.3 = tight cluster at center, 1.2 = wider spawn zone
-#define STAR_BEAT_SURGE   1.55f   // extra accel multiplier on a beat (layered on top of STAR_ACCEL)
+#define STAR_BEAT_SURGE   1.45f   // extra accel multiplier on a beat (layered on top of STAR_ACCEL)
 
 // ── Matrix geometry ───────────────────────────────────────────────────────────
 // Half-extents in float space. Stars are culled when abs(dx) or abs(dy) exceeds these.
@@ -1272,6 +1272,341 @@ static void renderStarfield() {
     }
 }
 
+// =============================================================================
+// MODE_DUNE -- Desert dune ridges, sand palette, slow organic morphing
+//
+// Architecture
+// ------------
+//   The scene is a smooth mathematical field evaluated per-pixel each frame.
+//   Two S-ridge curves define the dune shapes. Each ridge is a sine-based
+//   ridge function: bright at the curve spine, falling off smoothly to the
+//   sides. The two ridges sum to produce the final field value (0.0-1.0)
+//   which maps to a sand colour palette (deep brown -> golden -> pale yellow).
+//
+//   A very slow inoise8 micro-texture term prevents the static periods from
+//   looking digitally frozen -- it drifts imperceptibly, like heat shimmer.
+//
+//   S-curve shape: each curve is defined by (cx, cy, amplitude, frequency,
+//   angle, phase). An S is produced by a sine whose argument is the projected
+//   distance along the curve axis, creating the characteristic double-bend.
+//   Ridge width (falloff) is a separate parameter.
+//
+//   State machine:
+//     STATIC   45-60s  parameters completely frozen (micro-texture still drifts)
+//     MORPHING 10-20s  all curve parameters lerp smoothly toward new targets
+//     SETTLING  2- 3s  brief deceleration pause before returning to STATIC
+//
+//   Dust twinkles: independent 45-60s timer, spawns 3-6 bright highlight pixels
+//   that fade over ~40 frames. Completely decoupled from morphing state.
+//
+//   Beat modulation: a beat briefly brightens the micro-texture contrast,
+//   producing a subtle shimmer across the whole scene.
+// =============================================================================
+#elif ACTIVE_MODE == MODE_DUNE
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+#define DUNE_NUM_RIDGES      2      // number of S-curve ridges
+#define DUNE_RIDGE_WIDTH   1.8f     // falloff half-width in pixel units
+                                    // smaller = sharper ridges, larger = softer
+#define DUNE_TEXTURE_SPEED   3      // inoise z-drift per frame (micro-texture)
+                                    // 0 = frozen, 8 = visible shimmer
+#define DUNE_TEXTURE_DEPTH 0.12f    // how much micro-texture modulates brightness
+                                    // 0.0 = none, 0.25 = noticeable grain
+#define DUNE_STATIC_MIN   45000UL   // minimum static hold time (ms)
+#define DUNE_STATIC_MAX   60000UL   // maximum static hold time (ms)
+#define DUNE_MORPH_MIN    10000UL   // minimum morph duration (ms)
+#define DUNE_MORPH_MAX    20000UL   // maximum morph duration (ms)
+#define DUNE_SETTLE_MS     2500UL   // settling pause after morph (ms)
+#define DUNE_DUST_MIN     45000UL   // minimum time between dust twinkles (ms)
+#define DUNE_DUST_MAX     60000UL   // maximum time between dust twinkles (ms)
+#define DUNE_DUST_COUNT_MIN  3      // minimum dust pixels per event
+#define DUNE_DUST_COUNT_MAX  6      // maximum dust pixels per event
+#define DUNE_DUST_FADE      40      // frames a dust pixel takes to fade out
+
+// ── Sand colour palette ───────────────────────────────────────────────────────
+// field value 0.0 = deep shadowed brown
+// field value 0.5 = rich golden sand
+// field value 1.0 = bright pale sun-bleached crest
+// Each entry is {r, g, b} for field value i/7.
+static const uint8_t _dunePal[][3] = {
+    {  42,  22,   5 },   // 0.00 -- deep shadow brown
+    {  72,  38,  10 },   // 0.14 -- dark amber brown
+    { 120,  68,  18 },   // 0.29 -- warm brown
+    { 175, 110,  30 },   // 0.43 -- golden brown
+    { 210, 150,  45 },   // 0.57 -- rich gold
+    { 235, 185,  75 },   // 0.71 -- bright sandy gold
+    { 248, 218, 130 },   // 0.86 -- pale warm yellow
+    { 255, 240, 185 },   // 1.00 -- bleached crest
+};
+#define _DUNE_PAL_LEN  8
+
+// Interpolate sand palette for field value 0.0-1.0
+static uint16_t _duneColor(float v) {
+    v = fmaxf(0.0f, fminf(1.0f, v));
+    float fi  = v * (_DUNE_PAL_LEN - 1);
+    int   lo  = (int)fi;
+    int   hi  = lo + 1;
+    if (hi >= _DUNE_PAL_LEN) hi = _DUNE_PAL_LEN - 1;
+    float t   = fi - (float)lo;
+    uint8_t r = (uint8_t)(_dunePal[lo][0] + t * ((float)_dunePal[hi][0] - _dunePal[lo][0]));
+    uint8_t g = (uint8_t)(_dunePal[lo][1] + t * ((float)_dunePal[hi][1] - _dunePal[lo][1]));
+    uint8_t b = (uint8_t)(_dunePal[lo][2] + t * ((float)_dunePal[hi][2] - _dunePal[lo][2]));
+    return matrix.Color(r, g, b);
+}
+
+// ── Ridge parameters ──────────────────────────────────────────────────────────
+// Each ridge described by: center offset (cx,cy), S-amplitude, S-frequency,
+// rotation angle (radians), and a ridge brightness peak value.
+struct DuneRidge {
+    float cx;      // horizontal center offset (-1.0 to 1.0, in pixel units from matrix center)
+    float cy;      // vertical center offset
+    float amp;     // S-curve amplitude (half-swing in pixels)
+    float freq;    // S-curve spatial frequency
+    float angle;   // ridge axis rotation (radians)
+    float peak;    // brightness contribution at ridge spine (0.0-1.0)
+};
+
+static DuneRidge _duneCur[DUNE_NUM_RIDGES];   // current (displayed) params
+static DuneRidge _duneFrom[DUNE_NUM_RIDGES];  // morph start snapshot
+static DuneRidge _duneTo[DUNE_NUM_RIDGES];    // morph target
+
+// ── State machine ─────────────────────────────────────────────────────────────
+enum DuneState { DS_STATIC, DS_MORPHING, DS_SETTLING };
+static DuneState _duneState     = DS_STATIC;
+static uint32_t  _duneStateEnd  = 0;   // millis() when current state ends
+static float     _duneMorphT    = 0.0f; // 0.0->1.0 progress through morph
+static uint32_t  _duneMorphStart = 0;   // millis() when current morph started
+static uint32_t  _duneMorphDur   = 0;   // total morph duration in ms
+
+// ── Dust twinkle state ────────────────────────────────────────────────────────
+#define _DUNE_MAX_DUST  6
+struct DuneDust {
+    uint8_t col, row;
+    int     life;    // frames remaining (counts down)
+    bool    active;
+};
+static DuneDust  _duneDust[_DUNE_MAX_DUST];
+static uint32_t  _duneDustNext = 0;   // millis() when next dust event fires
+
+// ── Micro-texture ─────────────────────────────────────────────────────────────
+static uint32_t _duneNoiseZ   = 0;
+static float    _duneBeatGlow = 0.0f;   // brief brightness boost on beat
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Evaluate the ridge field contribution at pixel (px, py) for one ridge.
+// Returns 0.0 (far from ridge) to ridge.peak (at spine).
+static float _duneRidgeField(const DuneRidge& r, float px, float py) {
+    // Translate to ridge-local coordinates
+    float lx = px - r.cx;
+    float ly = py - r.cy;
+    // Rotate into ridge axis frame
+    float cosA = cosf(r.angle), sinA = sinf(r.angle);
+    float ax =  lx * cosA + ly * sinA;   // along ridge axis
+    float ay = -lx * sinA + ly * cosA;   // across ridge axis
+
+    // S-curve: spine position across axis as function of along-axis position
+    // sin(ax * freq) * amp gives the S shape
+    float spine = sinf(ax * r.freq) * r.amp;
+
+    // Distance from this pixel to the spine
+    float dist = fabsf(ay - spine);
+
+    // Smooth falloff: Gaussian-like using exp
+    float falloff = expf(-(dist * dist) / (DUNE_RIDGE_WIDTH * DUNE_RIDGE_WIDTH));
+
+    return r.peak * falloff;
+}
+
+// Randomise a ridge's target parameters — keep values plausible for dune shapes
+static void _duneRandomRidge(DuneRidge& r) {
+    // Center: anywhere in the matrix, biased toward the middle band
+    r.cx  = ((float)(int8_t)random8() / 128.0f) * 3.0f;
+    r.cy  = ((float)(int8_t)random8() / 128.0f) * 3.0f;
+    // Amplitude: 0.8 to 2.5 pixels — controls how pronounced the S bend is
+    r.amp  = 0.8f + ((float)random8() / 255.0f) * 1.7f;
+    // Frequency: how tightly the S winds — lower = lazy S, higher = tight zigzag
+    r.freq = 0.35f + ((float)random8() / 255.0f) * 0.55f;
+    // Angle: biased near horizontal/diagonal for dune-like orientation
+    r.angle = ((float)random8() / 255.0f) * (float)M_PI;
+    // Peak brightness: 0.55 to 1.0
+    r.peak = 0.55f + ((float)random8() / 255.0f) * 0.45f;
+}
+
+// Lerp a single ridge between from and to by t (0.0-1.0)
+// Uses smoothstep so motion eases in and out naturally
+static void _duneLerpRidge(DuneRidge& out,
+                            const DuneRidge& a, const DuneRidge& b, float t) {
+    // Smoothstep: 3t^2 - 2t^3
+    float s = t * t * (3.0f - 2.0f * t);
+    out.cx    = a.cx    + s * (b.cx    - a.cx);
+    out.cy    = a.cy    + s * (b.cy    - a.cy);
+    out.amp   = a.amp   + s * (b.amp   - a.amp);
+    out.freq  = a.freq  + s * (b.freq  - a.freq);
+    out.angle = a.angle + s * (b.angle - a.angle);
+    out.peak  = a.peak  + s * (b.peak  - a.peak);
+}
+
+static void _duneStartMorph() {
+    // Snapshot current as morph start
+    memcpy(_duneFrom, _duneCur, sizeof(_duneCur));
+    // Randomise targets
+    for (int i = 0; i < DUNE_NUM_RIDGES; i++) _duneRandomRidge(_duneTo[i]);
+    _duneMorphT     = 0.0f;
+    _duneMorphDur   = DUNE_MORPH_MIN +
+                      (uint32_t)(((float)random16() / 65535.0f) *
+                                  (float)(DUNE_MORPH_MAX - DUNE_MORPH_MIN));
+    _duneMorphStart = millis();
+    _duneStateEnd   = _duneMorphStart + _duneMorphDur;
+    _duneState      = DS_MORPHING;
+}
+
+static void _duneStartStatic() {
+    uint32_t dur = DUNE_STATIC_MIN +
+                   (uint32_t)(((float)random16() / 65535.0f) *
+                               (float)(DUNE_STATIC_MAX - DUNE_STATIC_MIN));
+    _duneStateEnd = millis() + dur;
+    _duneState    = DS_STATIC;
+}
+
+static void _duneSpawnDust() {
+    int count = DUNE_DUST_COUNT_MIN +
+                random8(0, DUNE_DUST_COUNT_MAX - DUNE_DUST_COUNT_MIN + 1);
+    int spawned = 0;
+    for (int i = 0; i < _DUNE_MAX_DUST && spawned < count; i++) {
+        if (!_duneDust[i].active) {
+            _duneDust[i].col    = random8(MATRIX_COLS);
+            _duneDust[i].row    = random8(MATRIX_ROWS);
+            _duneDust[i].life   = DUNE_DUST_FADE;
+            _duneDust[i].active = true;
+            spawned++;
+        }
+    }
+    // Schedule next dust event
+    _duneDustNext = millis() + DUNE_DUST_MIN +
+                    (uint32_t)(((float)random16() / 65535.0f) *
+                                (float)(DUNE_DUST_MAX - DUNE_DUST_MIN));
+}
+
+// ── Init (called from visualizerInit) ─────────────────────────────────────────
+static void _duneInit() {
+    // Seed ridges with reasonable initial values
+    for (int i = 0; i < DUNE_NUM_RIDGES; i++) {
+        _duneRandomRidge(_duneCur[i]);
+        _duneRandomRidge(_duneTo[i]);
+        memcpy(&_duneFrom[i], &_duneCur[i], sizeof(DuneRidge));
+    }
+    memset(_duneDust, 0, sizeof(_duneDust));
+    _duneBeatGlow  = 0.0f;
+    _duneNoiseZ    = random16();
+    _duneStartStatic();
+    _duneDustNext  = millis() + DUNE_DUST_MIN +
+                     (uint32_t)(((float)random16() / 65535.0f) *
+                                 (float)(DUNE_DUST_MAX - DUNE_DUST_MIN));
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+static void renderDune() {
+    uint32_t now = millis();
+
+    // ── Beat: shimmer burst ───────────────────────────────────────────────────
+    if (beatFired) _duneBeatGlow = 0.18f;
+    if (_duneBeatGlow > 0.0f) {
+        _duneBeatGlow -= 0.025f;
+        if (_duneBeatGlow < 0.0f) _duneBeatGlow = 0.0f;
+    }
+
+    // ── State machine ─────────────────────────────────────────────────────────
+    switch (_duneState) {
+        case DS_STATIC:
+            if (now >= _duneStateEnd) _duneStartMorph();
+            break;
+
+        case DS_MORPHING: {
+            if (now >= _duneStateEnd) {
+                // Morph complete: snap to targets, enter settling
+                memcpy(_duneCur, _duneTo, sizeof(_duneCur));
+                _duneMorphT   = 1.0f;
+                _duneStateEnd = now + DUNE_SETTLE_MS;
+                _duneState    = DS_SETTLING;
+            } else {
+                // t derived from wall time: (elapsed / total duration)
+                // _duneMorphStart stored when morph began, _duneStateEnd = start+dur
+                uint32_t elapsed = now - _duneMorphStart;
+                uint32_t total   = _duneMorphDur;
+                _duneMorphT = (total > 0)
+                    ? fminf(1.0f, (float)elapsed / (float)total)
+                    : 1.0f;
+                for (int i = 0; i < DUNE_NUM_RIDGES; i++)
+                    _duneLerpRidge(_duneCur[i], _duneFrom[i], _duneTo[i], _duneMorphT);
+            }
+            break;
+        }
+
+        case DS_SETTLING:
+            if (now >= _duneStateEnd) _duneStartStatic();
+            break;
+    }
+
+    // ── Dust twinkle scheduler ────────────────────────────────────────────────
+    if (now >= _duneDustNext) _duneSpawnDust();
+
+    // ── Advance micro-texture ─────────────────────────────────────────────────
+    _duneNoiseZ += DUNE_TEXTURE_SPEED;
+
+    // ── Render field ──────────────────────────────────────────────────────────
+    matrix.setBrightness(BRIGHTNESS);
+
+    // Matrix center in pixel coords
+    float cx = (float)(MATRIX_COLS) * 0.5f - 0.5f;   // 3.5 for 8-wide matrix
+    float cy = (float)(MATRIX_ROWS) * 0.5f - 0.5f;   // 3.5 for 8-tall matrix
+
+    for (int col = 0; col < MATRIX_COLS; col++) {
+        for (int row = 0; row < MATRIX_ROWS; row++) {
+            // Pixel position relative to matrix center
+            float px = (float)col - cx;
+            float py = (float)row - cy;
+
+            // Sum ridge field contributions
+            float field = 0.0f;
+            for (int i = 0; i < DUNE_NUM_RIDGES; i++) {
+                field += _duneRidgeField(_duneCur[i], px, py);
+            }
+            // Clamp and normalise: each ridge contributes 0-peak,
+            // two ridges could sum to 2.0; normalise to 0-1.
+            field = fminf(1.0f, field / (float)DUNE_NUM_RIDGES);
+
+            // Micro-texture: very slow inoise8 drift
+            uint8_t nx = (uint8_t)(inoise8(
+                (uint16_t)(col * 28),
+                (uint16_t)(row * 28),
+                (uint16_t)(_duneNoiseZ >> 2)
+            ));
+            float texture = ((float)nx / 255.0f - 0.5f) * DUNE_TEXTURE_DEPTH;
+            field = fmaxf(0.0f, fminf(1.0f, field + texture + _duneBeatGlow));
+
+            matrix.drawPixel(col, DRAW_Y(row), _duneColor(field));
+        }
+    }
+
+    // ── Render dust twinkles on top of field ─────────────────────────────────
+    for (int i = 0; i < _DUNE_MAX_DUST; i++) {
+        DuneDust& d = _duneDust[i];
+        if (!d.active) continue;
+        // Brightness: full at life=DUNE_DUST_FADE, zero at life=0
+        float t   = (float)d.life / (float)DUNE_DUST_FADE;
+        // Ease out: t^2 for a quick bright flash then gentle fade
+        uint8_t bri = (uint8_t)(t * t * 255.0f);
+        // Dust colour: pale warm white with a hint of gold
+        uint8_t r = bri;
+        uint8_t g = (uint8_t)(bri * 0.92f);
+        uint8_t b = (uint8_t)(bri * 0.60f);
+        matrix.drawPixel(d.col, DRAW_Y(d.row), matrix.Color(r, g, b));
+        d.life--;
+        if (d.life <= 0) d.active = false;
+    }
+}
+
 #endif // end of mode implementations
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1310,6 +1645,8 @@ void visualizerInit() {
 #elif ACTIVE_MODE == MODE_STARFIELD
     for (int i = 0; i < STAR_COUNT; i++) _sfSpawnStar(_sfStars[i]);
     _sfAccelBoost = 0.0f;
+#elif ACTIVE_MODE == MODE_DUNE
+    _duneInit();
 #endif
 }
 
@@ -1358,6 +1695,8 @@ void visualizerUpdate() {
     renderRain();
 #elif ACTIVE_MODE == MODE_STARFIELD
     renderStarfield();
+#elif ACTIVE_MODE == MODE_DUNE
+    renderDune();
 #endif
 
     matrix.show();
