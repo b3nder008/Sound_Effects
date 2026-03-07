@@ -1085,6 +1085,193 @@ static void renderRain() {
     }
 }
 
+
+// =============================================================================
+// MODE_STARFIELD -- Classic warp-speed starfield
+//
+// Architecture
+// ------------
+//   Each star lives in a float coordinate space centered on the matrix center
+//   (origin = 0,0). Every frame its offset vector (dx, dy) is scaled outward
+//   by STAR_ACCEL raised to a power proportional to its current distance from
+//   center -- stars start slow near the origin and accelerate exponentially as
+//   they approach the edges, exactly like the classic warp effect.
+//
+//   Trail: each star remembers up to STAR_TRAIL_LEN previous integer screen
+//   positions. Each trail step is rendered at a fraction of the head brightness,
+//   giving a directional streak that always points back toward center.
+//
+//   Color: STAR_COLOR_CHANCE percent of stars are assigned a faint hue tint
+//   (red, amber, cyan, or blue) at birth. All others are pure greyscale.
+//
+//   Beat modulation: a beat briefly boosts STAR_ACCEL, causing a momentary
+//   warp-jump surge that snaps back to normal over ~8 frames.
+//
+// Tuning constants (all at the top of this block):
+//   STAR_COUNT         -- number of simultaneous stars (density)
+//   STAR_ACCEL         -- base outward acceleration factor per frame (speed)
+//   STAR_TRAIL_DECAY   -- brightness fraction each trail step (trail length feel)
+//   STAR_TRAIL_LEN     -- how many past positions to keep (trail pixel count)
+//   STAR_COLOR_CHANCE  -- % of stars that get a color tint (0-100)
+//   STAR_SPAWN_RADIUS  -- how close to center new stars spawn (smaller = tighter)
+//   STAR_BEAT_SURGE    -- extra accel multiplier on a beat hit
+// =============================================================================
+#elif ACTIVE_MODE == MODE_STARFIELD
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+#define STAR_COUNT          12    // number of simultaneous stars
+                                  // 8-12 = sparse, 18-24 = busy, 30+ = dense
+#define STAR_ACCEL        1.28f   // outward scale factor per frame
+                                  // 1.10 = gentle drift, 1.18 = warp, 1.28 = fast
+#define STAR_TRAIL_DECAY  0.65f   // brightness of each successive trail step
+                                  // 0.25 = short dim trail, 0.55 = long bright trail
+#define STAR_TRAIL_LEN       4    // number of trail positions stored per star
+                                  // 1 = single ghost pixel, 4 = visible streak
+#define STAR_COLOR_CHANCE    5    // % of stars that get a color tint (0-100)
+#define STAR_SPAWN_RADIUS  0.3f   // spawn within this radius of center (matrix half-width units)
+                                  // 0.3 = tight cluster at center, 1.2 = wider spawn zone
+#define STAR_BEAT_SURGE   1.55f   // extra accel multiplier on a beat (layered on top of STAR_ACCEL)
+
+// ── Matrix geometry ───────────────────────────────────────────────────────────
+// Half-extents in float space. Stars are culled when abs(dx) or abs(dy) exceeds these.
+#define _SF_HW  ((float)(MATRIX_COLS) * 0.5f)   // 4.0 for 8-wide
+#define _SF_HH  ((float)(MATRIX_ROWS) * 0.5f)   // 4.0 for 8-tall
+#define _SF_CX  (_SF_HW - 0.5f)                  // center X pixel (3.5)
+#define _SF_CY  (_SF_HH - 0.5f)                  // center Y pixel (3.5)
+
+// ── Star color tints (faint — blended with grey at low weight) ─────────────
+// Each tint is (r_bias, g_bias, b_bias) added to the greyscale base.
+// Kept subtle so the field reads as greyscale with occasional colour stars.
+static const int8_t _sfTints[][3] = {
+    { 60, -10, -10 },   // warm red-orange
+    { 40,  20, -20 },   // amber
+    {-20,  10,  60 },   // cold blue
+    {-10,  50,  50 },   // cyan
+    { 50, -20,  50 },   // violet
+};
+#define _SF_TINT_COUNT  5
+
+// ── Star ──────────────────────────────────────────────────────────────────────
+struct Star {
+    float   dx, dy;         // position offset from center (float space)
+    float   vx, vy;         // velocity (derived from position, kept for continuity)
+    uint8_t bri;            // head brightness
+    int8_t  tintIdx;        // -1 = greyscale, 0..4 = color tint index
+    // Trail: ring buffer of recent integer screen positions
+    int8_t  trailX[STAR_TRAIL_LEN];
+    int8_t  trailY[STAR_TRAIL_LEN];
+    uint8_t trailHead;      // ring buffer write index
+    bool    active;
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static Star    _sfStars[STAR_COUNT];
+static float   _sfAccelBoost = 0.0f;   // extra accel from beat, decays each frame
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+static void _sfSpawnStar(Star& s) {
+    // Random position within spawn radius, avoiding the exact center pixel
+    float angle = (float)random16() * (2.0f * (float)M_PI / 65536.0f);
+    float r     = STAR_SPAWN_RADIUS * ((float)random8(8, 255) / 255.0f);
+    s.dx = r * cosf(angle);
+    s.dy = r * sinf(angle);
+    // Initial velocity tiny — let acceleration build it up naturally
+    s.vx = s.dx * 0.01f;
+    s.vy = s.dy * 0.01f;
+    s.bri = random8(140, 255);
+    // Color tint assignment
+    if ((int)random8(0, 100) < STAR_COLOR_CHANCE) {
+        s.tintIdx = (int8_t)random8(0, _SF_TINT_COUNT);
+    } else {
+        s.tintIdx = -1;
+    }
+    // Clear trail
+    for (int i = 0; i < STAR_TRAIL_LEN; i++) {
+        s.trailX[i] = (int8_t)_SF_CX;
+        s.trailY[i] = (int8_t)_SF_CY;
+    }
+    s.trailHead = 0;
+    s.active    = true;
+}
+
+// Convert float offset from center to integer screen pixel col/row
+static inline int _sfToCol(float dx) { return (int)(_SF_CX + dx); }
+static inline int _sfToRow(float dy) { return (int)(_SF_CY + dy); }
+static inline bool _sfOnScreen(int col, int row) {
+    return col >= 0 && col < MATRIX_COLS && row >= 0 && row < MATRIX_ROWS;
+}
+
+static void _sfDrawPixel(int col, int row, uint8_t bri, int8_t tintIdx) {
+    if (!_sfOnScreen(col, row)) return;
+    uint8_t r = bri, g = bri, b = bri;
+    if (tintIdx >= 0) {
+        // Apply tint: clamp each channel to 0-255
+        r = (uint8_t)constrain((int)bri + _sfTints[tintIdx][0], 0, 255);
+        g = (uint8_t)constrain((int)bri + _sfTints[tintIdx][1], 0, 255);
+        b = (uint8_t)constrain((int)bri + _sfTints[tintIdx][2], 0, 255);
+    }
+    matrix.drawPixel(col, DRAW_Y(row), matrix.Color(r, g, b));
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+static void renderStarfield() {
+
+    // Beat: inject a temporary accel boost that decays over ~8 frames
+    if (beatFired) {
+        _sfAccelBoost = STAR_BEAT_SURGE - 1.0f;  // surplus above base accel
+    }
+    float accel = STAR_ACCEL + _sfAccelBoost;
+    if (_sfAccelBoost > 0.0f) {
+        _sfAccelBoost *= 0.75f;   // decay boost
+        if (_sfAccelBoost < 0.01f) _sfAccelBoost = 0.0f;
+    }
+
+    // Clear matrix
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+
+    for (int i = 0; i < STAR_COUNT; i++) {
+        Star& s = _sfStars[i];
+        if (!s.active) { _sfSpawnStar(s); continue; }
+
+        // ── Draw trail (oldest first, dimmest first) ──────────────────────────
+        // Walk backwards through ring buffer: trailHead-1 is most recent,
+        // trailHead-(STAR_TRAIL_LEN) is oldest.
+        float trailBri = (float)s.bri * STAR_TRAIL_DECAY;
+        for (int t = 1; t <= STAR_TRAIL_LEN; t++) {
+            int idx = (s.trailHead - t + STAR_TRAIL_LEN) % STAR_TRAIL_LEN;
+            uint8_t tb = (uint8_t)(trailBri * powf(STAR_TRAIL_DECAY, (float)(t - 1)));
+            if (tb > 6) {
+                _sfDrawPixel(s.trailX[idx], s.trailY[idx], tb, s.tintIdx);
+            }
+        }
+
+        // ── Draw head ─────────────────────────────────────────────────────────
+        int col = _sfToCol(s.dx);
+        int row = _sfToRow(s.dy);
+        _sfDrawPixel(col, row, s.bri, s.tintIdx);
+
+        // ── Store current position in trail ring buffer ───────────────────────
+        s.trailX[s.trailHead] = (int8_t)col;
+        s.trailY[s.trailHead] = (int8_t)row;
+        s.trailHead = (s.trailHead + 1) % STAR_TRAIL_LEN;
+
+        // ── Accelerate outward ────────────────────────────────────────────────
+        // Scale the position vector by accel factor. Distance from center grows
+        // exponentially, which is what produces the warp acceleration feel.
+        // Stars close to center move slowly; stars near the edge move fast.
+        s.dx *= accel;
+        s.dy *= accel;
+
+        // ── Cull star if it leaves the screen ─────────────────────────────────
+        // Use a slight overshoot margin so stars don't pop out before their
+        // trail has also cleared the visible area.
+        if (fabsf(s.dx) > _SF_HW + 1.5f || fabsf(s.dy) > _SF_HH + 1.5f) {
+            _sfSpawnStar(s);
+        }
+    }
+}
+
 #endif // end of mode implementations
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1120,6 +1307,9 @@ void visualizerInit() {
     memset(_rainGhost,  0, sizeof(_rainGhost));
     memset(_rainSnap,   0, sizeof(_rainSnap));
     _rainFlashFrames = 0;
+#elif ACTIVE_MODE == MODE_STARFIELD
+    for (int i = 0; i < STAR_COUNT; i++) _sfSpawnStar(_sfStars[i]);
+    _sfAccelBoost = 0.0f;
 #endif
 }
 
@@ -1166,6 +1356,8 @@ void visualizerUpdate() {
     renderTwinkles();
 #elif ACTIVE_MODE == MODE_RAIN
     renderRain();
+#elif ACTIVE_MODE == MODE_STARFIELD
+    renderStarfield();
 #endif
 
     matrix.show();
