@@ -59,7 +59,7 @@
 // ── Master enable ─────────────────────────────────────────────────────────────
 // 0 = compile out all button code — boot straight into ACTIVE_MODE at full bri
 // 1 = full button support
-#define BUTTONS_ENABLED  0
+#define BUTTONS_ENABLED  1
 
 // ── GPIO pins ─────────────────────────────────────────────────────────────────
 #define BTN_MODE_PIN    D3   // GPIO5

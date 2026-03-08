@@ -87,9 +87,9 @@ void loop() {
 
 #if DEBUG_SERIAL
         if (Serial) {
-            Serial.print("M="); Serial.print(buttonsCurrentMode());
-            Serial.print(" B="); Serial.print(buttonsBrightness());
-            Serial.print(" P="); Serial.print(buttonsPowerOn() ? "on" : "off");
+            Serial.print(visualizerModeName(buttonsCurrentMode()));
+            Serial.print(" bri="); Serial.print(buttonsBrightness());
+            Serial.print(" pwr="); Serial.print(buttonsPowerOn() ? "on" : "off");
             Serial.print("  ");
             for (int b = 0; b < NUM_BANDS; b++) {
                 Serial.print("B"); Serial.print(b); Serial.print("=");

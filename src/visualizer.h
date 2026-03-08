@@ -2,44 +2,48 @@
 /*
  * visualizer.h
  * ─────────────────────────────────────────────────────────────────────────────
- * Hardware constants and the single mode-select switch.
+ * Hardware constants, the mode registry, and the visualizer public API.
  *
  * ══════════════════════════════════════════════════════════════════════════════
- * HOW TO SWITCH MODES
+ * ADDING OR RENAMING A MODE — edit exactly ONE place
  * ══════════════════════════════════════════════════════════════════════════════
- * Change ACTIVE_MODE to any one value from the list below. Recompile.
- * Only the selected mode's code is compiled — everything else costs zero flash.
  *
- *   MODE_SPECTRUM          Audio spectrum analyzer bars (the original display)
- *   MODE_FIRE              Fire2012 simulation, HeatColors palette
- *   MODE_TORCH             Lukas Zeller torch (orange flame, green_energy = 20)
- *   MODE_TORCH2            Torch variant with more yellow (green_energy = 80)
- *   MODE_PULSE             Expanding concentric rings, palette colours
- *   MODE_WAVE              Sine wave sweeping with dimAll trail
- *   MODE_RAINBOW_NOISE     Perlin noise field, RainbowColors palette
- *   MODE_RAINBOW_STRIPE_NOISE  Perlin noise, RainbowStripe palette
- *   MODE_PARTY_NOISE       Perlin noise, PartyColors palette
- *   MODE_FOREST_NOISE      Perlin noise, ForestColors palette
- *   MODE_CLOUD_NOISE       Perlin noise, CloudColors palette
- *   MODE_FIRE_NOISE        Perlin noise, HeatColors palette (hueReduce=60)
- *   MODE_LAVA_NOISE        Perlin noise, LavaColors palette
- *   MODE_OCEAN_NOISE       Perlin noise, OceanColors palette
- *   MODE_CONFETTI          Random palette speckles fading to black
- *   MODE_JUGGLE            3 hue-dots weaving in/out with beatsin16 positions
- *   MODE_SINELON           Dot sweeping back and forth with fading trail
- *   MODE_PRIDE             Pride2015 shifting rainbow (sin16 / beatsin88)
- *   MODE_COLOR_WAVES       colorwaves() with cycling gradient palettes
- *   MODE_RAINBOW           fill_rainbow(gHue, 1)
- *   MODE_RAINBOW_GLITTER   fill_rainbow + random white sparkle
- *   MODE_HUE_CYCLE         fill_solid with slowly cycling hue
- *   MODE_CLOUD_TWINKLES    colortwinkles — CloudColors palette
- *   MODE_RAINBOW_TWINKLES  colortwinkles — RainbowColors palette
- *   MODE_RAIN              Falling rain streaks, grey-blue, ghost trails, lightning
- *   MODE_STARFIELD         Classic warp-speed starfield, accelerating outward from center
- *   MODE_DUNE               Desert dune ridges, sand palette, slow S-curve morphing, dust twinkles
- *   MODE_GEOMETRIC           Overlapping rectangles, colour palette cycles, jiggle and migrate
- *   MODE_WISP               Will-o'-the-wisp: drifting pale blue-green blob with orbiting sparkles
-   MODE_PCBA               PCB artwork: green board outlines with golden spark traces
+ * Everything — numeric IDs, button cycling order, debug names — is derived
+ * from the single X-macro table VISUALIZER_MODE_TABLE below.
+ *
+ * To add a new mode:
+ *   1. Append a new  X(MODE_MYMODE, "My mode description")  line to the table.
+ *   2. Implement  renderMymode()  and  _mymodeInit()  in visualizer.cpp.
+ *   3. Add  if (mode == MODE_MYMODE) _mymodeInit();  in visualizerSetMode().
+ *   4. Add  case MODE_MYMODE: renderMymode(); break;  in visualizerUpdate().
+ *
+ * That's it.  buttons.cpp, the numeric IDs, and the button cycling order all
+ * update automatically.  No other file needs to change.
+ *
+ * To change button cycling order, reorder rows in VISUALIZER_MODE_TABLE.
+ * To exclude a mode from button cycling, comment out its row.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════
+ * HOW IT WORKS — X-macro pattern
+ * ══════════════════════════════════════════════════════════════════════════════
+ *
+ * VISUALIZER_MODE_TABLE(X) expands X(id, description) for every mode.
+ * Different consumers define X differently:
+ *
+ *   Numeric IDs (enum):
+ *     #define X(id, desc) id,
+ *     enum { VISUALIZER_MODE_TABLE(X) };        → MODE_SPECTRUM=0, etc.
+ *     #undef X
+ *
+ *   Button cycling array (buttons.cpp):
+ *     #define X(id, desc) id,
+ *     static const uint8_t MODE_TABLE[] = { VISUALIZER_MODE_TABLE(X) };
+ *     #undef X
+ *
+ *   Debug name lookup:
+ *     #define X(id, desc) desc,
+ *     static const char* MODE_NAMES[] = { VISUALIZER_MODE_TABLE(X) };
+ *     #undef X
  *
  * ══════════════════════════════════════════════════════════════════════════════
  * BEAT DETECTION
@@ -47,46 +51,61 @@
  * Beat detection runs for every mode. Each mode's render function receives
  * a beatEnergy float (1.0 on a kick, decaying to 0.0 over ~7 frames) and a
  * beatFired bool (true for exactly one frame per detected beat).
- * Use them — or ignore them — inside each mode's render function.
- *
- * For MODE_SPECTRUM the beat produces a global brightness flash, exactly
- * as the original code did.
  */
 
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_NeoMatrix.h>
 
-// ── Compile-time default mode ───────────────────────────────────────────────
-// Used when BUTTONS_ENABLED 0 — device boots straight into this effect.
-// When BUTTONS_ENABLED 1 the MODE button overrides this at runtime.
-#define ACTIVE_MODE  MODE_SPECTRUM
+// ══════════════════════════════════════════════════════════════════════════════
+// MODE REGISTRY — edit here only
+// X(identifier, "description")
+// Order = button cycling order. Comment out a row to exclude from cycling.
+// ══════════════════════════════════════════════════════════════════════════════
+#define VISUALIZER_MODE_TABLE(X) \
+    X(MODE_SPECTRUM,             "Spectrum analyser bars")            \
+    X(MODE_FIRE,                 "Fire2012 simulation")               \
+    X(MODE_TORCH,                "Torch (cool)")                      \
+    X(MODE_TORCH2,               "Torch (warm)")                      \
+    X(MODE_RAIN,                 "Falling rain + lightning")          \
+    X(MODE_STARFIELD,            "Warp-speed starfield")              \
+    X(MODE_WISP,                 "Will-o'-the-wisp")                  \
+    X(MODE_PCBA,                 "PCB traces")                        \
+    X(MODE_ATOM,                 "Bohr atom model")                   \
+    X(MODE_GEOMETRIC,            "Geometric rectangles")              \
+    X(MODE_DUNE,                 "Desert dunes")                      \
+    X(MODE_PULSE,                "Expanding rings")                   \
+    X(MODE_WAVE,                 "Sine wave sweep")                   \
+    X(MODE_RAINBOW_NOISE,        "Rainbow Perlin noise")              \
+    X(MODE_RAINBOW_STRIPE_NOISE, "Rainbow stripe noise")              \
+    X(MODE_PARTY_NOISE,          "Party noise")                       \
+    X(MODE_FOREST_NOISE,         "Forest noise")                      \
+    X(MODE_CLOUD_NOISE,          "Cloud noise")                       \
+    X(MODE_FIRE_NOISE,           "Fire noise")                        \
+    X(MODE_LAVA_NOISE,           "Lava noise")                        \
+    X(MODE_OCEAN_NOISE,          "Ocean noise")                       \
+    X(MODE_CONFETTI,             "Confetti speckles")                 \
+    X(MODE_PRIDE,                "Pride shifting rainbow")            \
+    X(MODE_COLOR_WAVES,          "Color waves")                       \
+    X(MODE_RAINBOW,              "Rainbow")                           \
+    X(MODE_RAINBOW_GLITTER,      "Rainbow + glitter")                 \
+    X(MODE_HUE_CYCLE,            "Hue cycle solid")                   \
+    X(MODE_CLOUD_TWINKLES,       "Cloud twinkles")                    \
+    X(MODE_RAINBOW_TWINKLES,     "Rainbow twinkles")                  \
+    X(MODE_SINELON,              "Sinelon dot")                       \
+    X(MODE_JUGGLE,               "Juggle dots")                       \
 
-// ── Mode identifiers ─────────────────────────────────────────────────────────
-#define MODE_SPECTRUM              0
-#define MODE_FIRE                  1
-#define MODE_TORCH                 2
-#define MODE_TORCH2                3
-#define MODE_PULSE                 4
-#define MODE_WAVE                  5
-#define MODE_RAINBOW_NOISE         6
-#define MODE_RAINBOW_STRIPE_NOISE  7
-#define MODE_PARTY_NOISE           8
-#define MODE_FOREST_NOISE          9
-#define MODE_CLOUD_NOISE          10
-#define MODE_FIRE_NOISE           11
-#define MODE_LAVA_NOISE           12
-#define MODE_OCEAN_NOISE          13
-#define MODE_CONFETTI             14
-#define MODE_JUGGLE               15
-#define MODE_SINELON              16
-#define MODE_PRIDE                17
-#define MODE_COLOR_WAVES          18
-#define MODE_RAINBOW              19
-#define MODE_RAINBOW_GLITTER      20
-#define MODE_HUE_CYCLE            21
-#define MODE_CLOUD_TWINKLES       22
-#define MODE_RAINBOW_TWINKLES     23
+// ── Auto-generate numeric IDs from the table ──────────────────────────────────
+// Each MODE_xxx constant equals its zero-based position in the table.
+// Never assign these manually — let the enum do it.
+#define _VMODE_X_ENUM(id, desc) id,
+enum { VISUALIZER_MODE_TABLE(_VMODE_X_ENUM) _VMODE_COUNT };
+#undef _VMODE_X_ENUM
+
+// ── Compile-time default mode ─────────────────────────────────────────────────
+// Used when BUTTONS_ENABLED 0 — device boots straight into this effect.
+// When BUTTONS_ENABLED 1 the MODE button overrides this at runtime via buttons.
+#define ACTIVE_MODE  MODE_ATOM
 
 // ── Hardware ──────────────────────────────────────────────────────────────────
 #define MATRIX_PIN   D10
@@ -94,7 +113,6 @@
 #define MATRIX_ROWS  8
 #define NUM_LEDS     (MATRIX_COLS * MATRIX_ROWS)
 
-// NeoMatrix wiring flags — adjust if your pixel 0 is somewhere else
 #define MATRIX_TYPE  (NEO_MATRIX_BOTTOM + NEO_MATRIX_LEFT + \
                       NEO_MATRIX_ROWS   + NEO_MATRIX_ZIGZAG)
 
@@ -104,10 +122,6 @@
 // ── Public API ────────────────────────────────────────────────────────────────
 void visualizerInit();
 void visualizerUpdate();
-void visualizerSetMode(uint8_t mode);  // runtime mode switch (called by buttons.cpp)
-#define MODE_RAIN                 24
-#define MODE_STARFIELD            25
-#define MODE_DUNE                 26
-#define MODE_GEOMETRIC            27
-#define MODE_WISP                 29
-#define MODE_PCBA                 30
+void visualizerSetMode(uint8_t mode);  // runtime mode switch
+uint8_t visualizerModeCount();         // returns _VMODE_COUNT
+const char* visualizerModeName(uint8_t mode); // returns description string

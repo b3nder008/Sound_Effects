@@ -12,34 +12,12 @@
 #if BUTTONS_ENABLED
 
 // ── Mode table ────────────────────────────────────────────────────────────────
-// Edit this list to choose which effects the MODE button cycles through
-// and in what order. Use the MODE_xxx constants from visualizer.h.
-// The table can be a subset — you don't have to include all 29 modes.
-static const uint8_t MODE_TABLE[] = {
-    MODE_SPECTRUM,
-    MODE_FIRE,
-    MODE_TORCH,
-    MODE_TORCH2,
-    MODE_RAIN,
-    MODE_STARFIELD,
-    MODE_GEOMETRIC,
-    MODE_DUNE,
-    MODE_PULSE,
-    MODE_WAVE,
-    MODE_RAINBOW_NOISE,
-    MODE_FIRE_NOISE,
-    MODE_OCEAN_NOISE,
-    MODE_CONFETTI,
-    MODE_PRIDE,
-    MODE_COLOR_WAVES,
-    MODE_RAINBOW_GLITTER,
-    MODE_RAINBOW_TWINKLES,
-    MODE_CLOUD_TWINKLES,
-    MODE_SINELON,
-    MODE_JUGGLE,
-    MODE_WISP,
-    MODE_PCBA,
-};
+// Automatically derived from VISUALIZER_MODE_TABLE in visualizer.h.
+// To add, remove, or reorder modes: edit visualizer.h only.
+// To temporarily exclude a mode from cycling: comment out its row there.
+#define _BTN_MODE_X(id, desc) id,
+static const uint8_t MODE_TABLE[] = { VISUALIZER_MODE_TABLE(_BTN_MODE_X) };
+#undef _BTN_MODE_X
 static const uint8_t MODE_TABLE_LEN =
     (uint8_t)(sizeof(MODE_TABLE) / sizeof(MODE_TABLE[0]));
 

@@ -1877,118 +1877,137 @@ static void renderGeometric() {
 // Architecture
 // ------------
 //   Six hand-crafted 8×8 board outlines cycle every PCBA_BOARD_CYCLE_MS ms.
-//   Each outline is a bitmask (one uint8_t per row, bit7=col0).
-//   The board cycles with a hard cut; inside pixels are rendered as dark/mid
-//   green PCB substrate with a faint grid of brighter green traces.
+//   A single Manhattan route is generated per round (PCBA_ROUND_MS = 300 s).
+//   The route is drawn on the board in lighter green for the full round,
+//   visible as a "copper track" even between spark bursts.
 //
-//   Routes are Manhattan paths traced inside the board mask, always starting
-//   from a top-edge pixel and walking downward (occasionally side-stepping).
-//   Between 6 and 10 routes are generated per board. After PCBA_ROUTE_CYCLE_MS
-//   all routes are re-randomised. Routes regenerate automatically on board
-//   change too.
+//   Board colours — exactly two
+//   ---------------------------
+//   Board interior (non-trace) : flat dark green  (0, 45, 4)
+//   Route trace                : light green      (0, 105, 32)
 //
-//   Sparks — pool of PCBA_MAX_SPARKS structs. Each spark rides one route,
-//   advancing at PCBA_SPARK_SPEED pixels/frame. A burst scheduler fires
-//   bursts of 1–3 sparks per route every PCBA_BURST_GAP frames. The head
-//   pixel is bright gold; a PCBA_TAIL_LEN-pixel ghost tail decays
-//   exponentially from gold → amber → dark brown.
+//   Route
+//   -----
+//   One route per round. Starts from a random top-edge pixel, walks downward
+//   with occasional side-steps (Manhattan, constrained inside board mask).
+//   Length PCBA_ROUTE_LEN_MIN–MAX. Re-generated at round start and board change.
 //
-//   Beat: brief speed surge on all active sparks.
+//   Sparks
+//   ------
+//   Pool of PCBA_MAX_SPARKS. Bursts of 1–6 sparks are fired per round with a
+//   3–15 second pause (millisecond timer) between bursts. Burst members are
+//   each separated by PCBA_SPARK_GAP_MS (2 s) after the prior spark clears.
+//
+//   Head  : white with aggressive per-frame flicker — randomly drops to near-off
+//           (~20% chance each frame) for a sharp electrical-arc stutter.
+//
+//   Tail  : PCBA_TAIL_LEN pixels long, piecewise colour gradient:
+//             t=0        → white (head; handled separately)
+//             t=1..40%   → white → bright gold
+//             t=40%..80% → bright gold → amber
+//             t=80%..end → amber → trace green  (0,105,32)
+//           Brightness uses a linear-then-slow-decay profile so the gold zone
+//           stays visibly bright rather than collapsing immediately.
+//
+//   Beat  : brief speed surge on all active sparks.
 // =============================================================================
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
-#define PCBA_MAX_SPARKS        18
-#define PCBA_TAIL_LEN           6    // pixels of ghost tail behind head
-#define PCBA_SPARK_SPEED      0.45f  // base pixels/frame (fast)
-#define PCBA_BURST_GAP_MIN     18    // min frames between bursts on one route
-#define PCBA_BURST_GAP_MAX     45    // max frames between bursts on one route
-#define PCBA_BOARD_CYCLE_MS  14000UL // ms between board shape changes
-#define PCBA_ROUTE_CYCLE_MS  60000UL // ms between route re-randomisation
-#define PCBA_MAX_ROUTES        10    // max routes per board
-#define PCBA_ROUTE_LEN_MIN      5    // minimum route length (pixels)
-#define PCBA_ROUTE_LEN_MAX     14    // maximum route length
-#define PCBA_BEAT_SURGE        1.8f  // speed multiplier on beat
-#define PCBA_BEAT_DECAY        0.88f // surge decay per frame
+#define PCBA_MAX_SPARKS         18
+#define PCBA_TAIL_LEN           12   // longer tail — more gold on screen
+#define PCBA_SPARK_SPEED       0.576f // base pixels/frame (+20%)
+#define PCBA_BURST_SIZE_MIN      1   // min sparks per burst
+#define PCBA_BURST_SIZE_MAX      6   // max sparks per burst
+#define PCBA_SPARK_GAP_MS     2000UL // ms gap after spark clears before next spark in burst
+#define PCBA_BURST_PAUSE_MIN  8000UL // ms minimum between bursts
+#define PCBA_BURST_PAUSE_MAX 25000UL // ms maximum between bursts
+#define PCBA_BOARD_CYCLE_MS 300000UL // ms per board (= round — one board per round)
+#define PCBA_ROUND_MS       300000UL // ms per route round
+#define PCBA_ROUTE_LEN_MIN       6   // minimum route length (steps)
+#define PCBA_ROUTE_LEN_MAX      14   // maximum route length
+#define PCBA_BEAT_SURGE         1.8f // speed multiplier on beat
+#define PCBA_BEAT_DECAY         0.88f
+// Head flicker — single pixel, oscillates 10%–100% brightness each frame
+#define PCBA_HEAD_MIN           26   // 10% of 255 — dimmest flicker value
+#define PCBA_HEAD_MAX          255   // 100% — brightest flicker value
 
-// ── Colour palette ────────────────────────────────────────────────────────────
-// PCB substrate: dark green
-#define PCBA_COL_DARK_R   0
-#define PCBA_COL_DARK_G  55
-#define PCBA_COL_DARK_B  18
-// PCB trace grid: mid green
-#define PCBA_COL_MID_R    0
-#define PCBA_COL_MID_G   90
-#define PCBA_COL_MID_B   28
-// Board edge highlight: slightly brighter
-#define PCBA_COL_EDGE_R   8
-#define PCBA_COL_EDGE_G  110
-#define PCBA_COL_EDGE_B   35
-// Spark head: bright gold
-#define PCBA_HEAD_R      255
-#define PCBA_HEAD_G      195
-#define PCBA_HEAD_B       10
-// Tail tip: dark amber
-#define PCBA_TAIL_R       60
-#define PCBA_TAIL_G       28
-#define PCBA_TAIL_B        0
-
+// ── Colours ───────────────────────────────────────────────────────────────────
+// Board interior — single flat dark green
+#define PCBA_COL_BOARD_R  0
+#define PCBA_COL_BOARD_G 45
+#define PCBA_COL_BOARD_B  4
+// Route trace — light green
+#define PCBA_COL_TRACE_R  0
+#define PCBA_COL_TRACE_G 105
+#define PCBA_COL_TRACE_B  32
+// Tail colour stops
+//   near-head zone : bright gold
+#define PCBA_GOLD_R  255
+#define PCBA_GOLD_G  200
+#define PCBA_GOLD_B   10
+//   mid zone       : amber
+#define PCBA_AMBER_R 210
+#define PCBA_AMBER_G  80
+#define PCBA_AMBER_B   0
+//   tip zone       : trace green (aliases so it auto-tracks trace colour)
+#define PCBA_TIP_R   PCBA_COL_TRACE_R
+#define PCBA_TIP_G   PCBA_COL_TRACE_G
+#define PCBA_TIP_B   PCBA_COL_TRACE_B
 // ── Board outline bitmasks ────────────────────────────────────────────────────
 // 6 shapes. Each row byte: bit7 = col 0 (left), bit0 = col 7 (right).
-// Shapes fill 6-7 columns/rows with PCB-plausible outlines.
-// Row order: row 0 = bottom, row 7 = top (matching DRAW_Y convention).
-
+// Row order: row 0 = bottom, row 7 = top.
 static const uint8_t _pcbaBoards[6][8] = {
-    // Shape 0: full rectangle with top notch (component keepout)
-    { 0b11111111,   // row 0  bottom
+    // 0: Full rectangle with top notches (component keepout)
+    { 0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
-      0b11011011 }, // row 7  top: notches at col1 and col5
+      0b11011011 },
 
-    // Shape 1: large rectangle, bottom-left corner cut
-    { 0b00111111,   // row 0  bottom-left 2px cut
+    // 1: Large rectangle, bottom-left corner cut, right-edge notch
+    { 0b00111111,
       0b01111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
-      0b11111110 }, // row 7  top: right edge notch
+      0b11111110 },
 
-    // Shape 2: D-shape — left side flat, right side has bite taken out centre
+    // 2: D-shape — right side has a bite taken out of the centre
     { 0b11111110,
       0b11111111,
       0b11111111,
-      0b11110111,   // centre-right pixel missing
+      0b11110111,
       0b11111111,
       0b11111111,
       0b11111110,
       0b11111100 },
 
-    // Shape 3: L-shape — upper-right quadrant absent
+    // 3: L-shape — upper-right quadrant absent
     { 0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
-      0b11110000,   // top half: right half missing
+      0b11110000,
       0b11110000,
       0b11110000,
       0b11110000 },
 
-    // Shape 4: castellated edges top + bottom (mounting pads)
-    { 0b10101010,   // bottom castellations
+    // 4: Castellated edges top + bottom (stamp-out module)
+    { 0b10101010,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
       0b11111111,
-      0b10101010 }, // top castellations
+      0b10101010 },
 
-    // Shape 5: plus/cross shape — corners removed
+    // 5: Plus/cross shape — corners removed
     { 0b00111100,
       0b01111110,
       0b11111111,
@@ -1999,127 +2018,101 @@ static const uint8_t _pcbaBoards[6][8] = {
       0b00111100 },
 };
 
-static inline bool _pcbaInBoard(int x, int y, uint8_t shapeIdx) {
+static inline bool _pcbaInBoard(int x, int y, uint8_t shape) {
     if (x < 0 || x > 7 || y < 0 || y > 7) return false;
-    return (_pcbaBoards[shapeIdx][y] >> (7 - x)) & 1;
+    return (_pcbaBoards[shape][y] >> (7 - x)) & 1;
 }
 
-// ── Route storage ─────────────────────────────────────────────────────────────
-struct PcbaRoute {
-    int8_t  px[PCBA_ROUTE_LEN_MAX]; // x coords
-    int8_t  py[PCBA_ROUTE_LEN_MAX]; // y coords
-    uint8_t len;                     // actual length
-    uint8_t burstTimer;              // frames until next burst launch
-    uint8_t burstRemain;             // sparks left to launch in current burst
-    uint8_t burstSpacing;            // frames between burst members
-    uint8_t burstSpacingTimer;
-};
+// ── Single route ──────────────────────────────────────────────────────────────
+#define PCBA_ROUTE_CAP  PCBA_ROUTE_LEN_MAX
 
-static PcbaRoute _pcbaRoutes[PCBA_MAX_ROUTES];
-static uint8_t   _pcbaNumRoutes = 0;
-static uint8_t   _pcbaShape     = 0;
+static int8_t  _pcbaRtX[PCBA_ROUTE_CAP]; // x coords of each step
+static int8_t  _pcbaRtY[PCBA_ROUTE_CAP]; // y coords of each step
+static uint8_t _pcbaRtLen = 0;           // actual number of steps
 
-// ── Spark storage ─────────────────────────────────────────────────────────────
+// ── Spark pool ────────────────────────────────────────────────────────────────
 struct PcbaSpark {
-    float   pos;         // position along route (0..route.len-1)
-    uint8_t routeIdx;
+    float   pos;         // float position along route (0 .. rtLen-1)
     float   speed;
     float   speedBoost;
     bool    active;
 };
-
 static PcbaSpark _pcbaSparks[PCBA_MAX_SPARKS];
 
-// ── Timing ────────────────────────────────────────────────────────────────────
-static uint32_t _pcbaBoardAt   = 0;  // millis of last board change
-static uint32_t _pcbaRouteAt   = 0;  // millis of last route regen
-static uint8_t  _pcbaFrameNo   = 0;  // wrapping frame counter
+// ── Spark sequencer ────────────────────────────────────────────────────────────
+// One spark travels at a time. After it fully clears the route (head + tail
+// both past the end), a PCBA_SPARK_GAP_MS pause fires before the next spark
+// in the burst. After a burst drains, PCBA_BURST_PAUSE_MIN/MAX applies.
+static uint32_t _pcbaNextSparkAt;    // millis() when next spark may launch
+static uint8_t  _pcbaBurstRemain;    // sparks still to launch in current burst
+
+// ── Timing / shape ────────────────────────────────────────────────────────────
+static uint32_t _pcbaBoardAt = 0;  // millis of last board change
+static uint32_t _pcbaRoundAt = 0;  // millis of last route regen
+static uint8_t  _pcbaShape   = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-static inline uint8_t _pcbaRand8(uint8_t lo, uint8_t hi) {
+static inline uint8_t _pcbaRandRange(uint8_t lo, uint8_t hi) {
     if (hi <= lo) return lo;
     return lo + random8(hi - lo + 1);
 }
 
 // ── Route generator ───────────────────────────────────────────────────────────
-// Walks Manhattan-style inside the board mask.
-// Always starts at a top-edge pixel (row 7) and tries to move downward.
-// Direction bias: 60% down, 20% left, 20% right. Never moves up.
-// Aborts (keeps partial path) if stuck for 4 consecutive steps.
+// One route: starts at a random top-edge pixel, walks downward with
+// occasional side-steps. Strictly inside board mask.
+static void _pcbaGenRoute(uint8_t shape) {
+    _pcbaRtLen = 0;
 
-static void _pcbaGenRoutes(uint8_t shape) {
-    _pcbaNumRoutes = 0;
-    memset(_pcbaRoutes, 0, sizeof(_pcbaRoutes));
-
-    // Collect all top-edge pixels as potential starts
+    // Collect top-edge (row 7) entry points
     int8_t topPx[8]; uint8_t nTop = 0;
     for (int x = 0; x < 8; x++)
         if (_pcbaInBoard(x, 7, shape)) topPx[nTop++] = x;
     if (nTop == 0) return;
 
-    uint8_t target = _pcbaRand8(6, 10); // how many routes to generate
-    uint8_t attempts = 0;
+    int8_t cx = topPx[random8(nTop)];
+    int8_t cy = 7;
+    _pcbaRtX[_pcbaRtLen] = cx;
+    _pcbaRtY[_pcbaRtLen] = cy;
+    _pcbaRtLen = 1;
 
-    while (_pcbaNumRoutes < target && _pcbaNumRoutes < PCBA_MAX_ROUTES
-           && attempts < 40) {
-        attempts++;
+    uint8_t stuck = 0;
+    while (_pcbaRtLen < PCBA_ROUTE_LEN_MAX && stuck < 5) {
+        // Bias: 60% down, 20% left, 20% right; never up
+        uint8_t roll = random8(5);
+        int8_t ndx, ndy;
+        if      (roll <= 2) { ndx =  0; ndy = -1; } // down
+        else if (roll == 3) { ndx = -1; ndy =  0; } // left
+        else                { ndx =  1; ndy =  0; } // right
 
-        // Pick a random top-edge start
-        int8_t sx = topPx[random8(nTop)];
-        int8_t sy = 7; // top row
+        int8_t nx = cx + ndx, ny = cy + ndy;
+        if (!_pcbaInBoard(nx, ny, shape)) { stuck++; continue; }
 
-        PcbaRoute rt;
-        rt.len = 0;
-        rt.px[rt.len] = sx;
-        rt.py[rt.len] = sy;
-        rt.len = 1;
+        // Avoid revisiting last 3 steps
+        bool revisit = false;
+        int look = (int)_pcbaRtLen - 1;
+        for (int k = look; k >= look - 2 && k >= 0; k--)
+            if (_pcbaRtX[k] == nx && _pcbaRtY[k] == ny)
+                { revisit = true; break; }
+        if (revisit) { stuck++; continue; }
 
-        int8_t cx = sx, cy = sy;
-        uint8_t stuck = 0;
-
-        while (rt.len < PCBA_ROUTE_LEN_MAX && stuck < 4) {
-            // Direction weights: down(2) left(1) right(1) — never up
-            uint8_t roll = random8(4);
-            int8_t ndx, ndy;
-            if      (roll <= 1) { ndx =  0; ndy = -1; } // down (in board coords)
-            else if (roll == 2) { ndx = -1; ndy =  0; } // left
-            else                { ndx =  1; ndy =  0; } // right
-
-            int8_t nx = cx + ndx, ny = cy + ndy;
-            if (!_pcbaInBoard(nx, ny, shape)) { stuck++; continue; }
-
-            // Avoid revisiting very recent pixels (last 3)
-            bool revisit = false;
-            for (int k = (int)rt.len - 1; k >= (int)rt.len - 3 && k >= 0; k--)
-                if (rt.px[k] == nx && rt.py[k] == ny) { revisit = true; break; }
-            if (revisit) { stuck++; continue; }
-
-            stuck = 0;
-            cx = nx; cy = ny;
-            rt.px[rt.len] = cx;
-            rt.py[rt.len] = cy;
-            rt.len++;
-        }
-
-        if (rt.len < PCBA_ROUTE_LEN_MIN) continue;
-
-        rt.burstTimer        = _pcbaRand8(PCBA_BURST_GAP_MIN, PCBA_BURST_GAP_MAX);
-        rt.burstRemain       = 0;
-        rt.burstSpacing      = 5;
-        rt.burstSpacingTimer = 0;
-        _pcbaRoutes[_pcbaNumRoutes++] = rt;
+        stuck = 0;
+        cx = nx; cy = ny;
+        _pcbaRtX[_pcbaRtLen] = cx;
+        _pcbaRtY[_pcbaRtLen] = cy;
+        _pcbaRtLen++;
     }
+    // Pad to minimum length by accepting whatever we got
+    // (even a short route is valid)
 }
 
 // ── Spark launcher ────────────────────────────────────────────────────────────
-static void _pcbaLaunchSpark(uint8_t routeIdx) {
+static void _pcbaLaunchSpark() {
     for (int i = 0; i < PCBA_MAX_SPARKS; i++) {
         if (_pcbaSparks[i].active) continue;
         _pcbaSparks[i].active     = true;
-        _pcbaSparks[i].routeIdx   = routeIdx;
         _pcbaSparks[i].pos        = 0.0f;
         _pcbaSparks[i].speed      = PCBA_SPARK_SPEED
-                                    * (0.85f + (float)random8(30) / 100.0f);
+                                    * (0.82f + (float)random8(36) / 100.0f);
         _pcbaSparks[i].speedBoost = 1.0f;
         return;
     }
@@ -2129,181 +2122,211 @@ static void _pcbaLaunchSpark(uint8_t routeIdx) {
 static void _pcbaInit() {
     _pcbaShape   = 0;
     _pcbaBoardAt = millis();
-    _pcbaRouteAt = millis();
-    _pcbaFrameNo = 0;
+    _pcbaRoundAt = millis();
     memset(_pcbaSparks, 0, sizeof(_pcbaSparks));
-    _pcbaGenRoutes(_pcbaShape);
+    _pcbaGenRoute(_pcbaShape);
+    {
+        _pcbaNextSparkAt = millis() + 300UL;  // first spark within 300 ms
+    }
+    _pcbaBurstRemain = 0;
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
 static void renderPcba() {
     uint32_t now = millis();
-    _pcbaFrameNo++;
 
     // ── Board shape cycle ─────────────────────────────────────────────────────
     if (now - _pcbaBoardAt >= PCBA_BOARD_CYCLE_MS) {
         _pcbaBoardAt = now;
         _pcbaShape   = (_pcbaShape + 1) % 6;
         memset(_pcbaSparks, 0, sizeof(_pcbaSparks));
-        _pcbaGenRoutes(_pcbaShape);
-        _pcbaRouteAt = now;
+        _pcbaGenRoute(_pcbaShape);
+        _pcbaRoundAt = now;
+        _pcbaNextSparkAt = now + 300UL;   // first spark within 300 ms
+        _pcbaBurstRemain = 0;
     }
 
-    // ── Route re-randomisation ────────────────────────────────────────────────
-    if (now - _pcbaRouteAt >= PCBA_ROUTE_CYCLE_MS) {
-        _pcbaRouteAt = now;
+    // ── Route round cycle (300 s) ─────────────────────────────────────────────
+    if (now - _pcbaRoundAt >= PCBA_ROUND_MS) {
+        _pcbaRoundAt = now;
         memset(_pcbaSparks, 0, sizeof(_pcbaSparks));
-        _pcbaGenRoutes(_pcbaShape);
+        _pcbaGenRoute(_pcbaShape);
+        _pcbaNextSparkAt = now + 300UL;   // first spark within 300 ms
+        _pcbaBurstRemain = 0;
     }
 
     // ── Beat ──────────────────────────────────────────────────────────────────
-    if (beatFired) {
+    if (beatFired)
         for (int i = 0; i < PCBA_MAX_SPARKS; i++)
             if (_pcbaSparks[i].active)
                 _pcbaSparks[i].speedBoost = PCBA_BEAT_SURGE;
-    }
 
-    // ── Burst scheduler — per route ───────────────────────────────────────────
-    for (int r = 0; r < _pcbaNumRoutes; r++) {
-        PcbaRoute& rt = _pcbaRoutes[r];
+    // ── Spark sequencer ───────────────────────────────────────────────────────
+    // Only one spark travels at a time. A spark is "clear" when its tail tip
+    // (pos - PCBA_TAIL_LEN) has passed the end of the route. After clearance
+    // the sequencer waits PCBA_SPARK_GAP_MS before the next spark in the burst,
+    // then PCBA_BURST_PAUSE_MIN/MAX between bursts.
+    {
+        // Check whether the active spark (if any) has fully cleared the route
+        bool anyActive = false;
+        for (int i = 0; i < PCBA_MAX_SPARKS; i++)
+            if (_pcbaSparks[i].active) { anyActive = true; break; }
 
-        if (rt.burstRemain > 0) {
-            // Mid-burst: spacing timer
-            if (rt.burstSpacingTimer == 0) {
-                _pcbaLaunchSpark(r);
-                rt.burstRemain--;
-                rt.burstSpacingTimer = rt.burstSpacing;
+        if (!anyActive && now >= _pcbaNextSparkAt) {
+            if (_pcbaBurstRemain > 0) {
+                // Still sparks left in this burst — launch the next one
+                _pcbaLaunchSpark();
+                _pcbaBurstRemain--;
+                // Next spark allowed after current clears + gap
+                // (will be re-evaluated each frame via anyActive check above)
             } else {
-                rt.burstSpacingTimer--;
-            }
-        } else {
-            // Between bursts
-            if (rt.burstTimer == 0) {
-                rt.burstRemain       = _pcbaRand8(1, 3);
-                rt.burstSpacing      = _pcbaRand8(4, 8);
-                rt.burstSpacingTimer = 0;
-                rt.burstTimer        = _pcbaRand8(PCBA_BURST_GAP_MIN,
-                                                   PCBA_BURST_GAP_MAX);
-            } else {
-                rt.burstTimer--;
+                // Burst drained — start a new burst after a long pause
+                _pcbaBurstRemain = PCBA_BURST_SIZE_MIN
+                                   + random8(PCBA_BURST_SIZE_MAX
+                                             - PCBA_BURST_SIZE_MIN + 1);
+                _pcbaLaunchSpark();
+                _pcbaBurstRemain--;  // consumed the first immediately
+                // Next burst pause will be set when this burst finishes
             }
         }
     }
 
     // ── Update sparks ─────────────────────────────────────────────────────────
+    // A spark retires when its tail tip clears the route end, i.e. when
+    // pos >= (rtLen - 1) + PCBA_TAIL_LEN.  On retirement set the gap timer.
+    float clearThresh = (float)(_pcbaRtLen - 1) + (float)PCBA_TAIL_LEN;
     for (int i = 0; i < PCBA_MAX_SPARKS; i++) {
         PcbaSpark& s = _pcbaSparks[i];
         if (!s.active) continue;
-
-        // Decay speed boost
         if (s.speedBoost > 1.01f) s.speedBoost *= PCBA_BEAT_DECAY;
         else s.speedBoost = 1.0f;
-
         s.pos += s.speed * s.speedBoost;
-
-        // Retire when past end of route
-        PcbaRoute& rt = _pcbaRoutes[s.routeIdx];
-        if (s.pos >= (float)(rt.len - 1)) s.active = false;
+        if (s.pos >= clearThresh) {
+            s.active = false;
+            // Set gap: PCBA_SPARK_GAP_MS within a burst, long pause between bursts
+            if (_pcbaBurstRemain > 0) {
+                _pcbaNextSparkAt = now + PCBA_SPARK_GAP_MS;
+            } else {
+                uint32_t pause = PCBA_BURST_PAUSE_MIN
+                                 + (uint32_t)random16()
+                                   % (PCBA_BURST_PAUSE_MAX
+                                      - PCBA_BURST_PAUSE_MIN + 1);
+                _pcbaNextSparkAt = now + pause;
+            }
+        }
     }
 
-    // ── Draw board background ─────────────────────────────────────────────────
+    // ── Draw board — two colours only ─────────────────────────────────────────
     matrix.setBrightness(BRIGHTNESS);
     matrix.fillScreen(0);
 
-    for (int y = 0; y < MATRIX_ROWS; y++) {
-        for (int x = 0; x < MATRIX_COLS; x++) {
-            if (!_pcbaInBoard(x, y, _pcbaShape)) continue;
+    for (int y = 0; y < MATRIX_ROWS; y++)
+        for (int x = 0; x < MATRIX_COLS; x++)
+            if (_pcbaInBoard(x, y, _pcbaShape))
+                matrix.drawPixel(x, DRAW_Y(y),
+                    matrix.Color(PCBA_COL_BOARD_R,
+                                 PCBA_COL_BOARD_G,
+                                 PCBA_COL_BOARD_B));
 
-            // Detect edge pixel: any 4-neighbour outside the board
-            bool edge = !_pcbaInBoard(x+1,y,_pcbaShape) ||
-                        !_pcbaInBoard(x-1,y,_pcbaShape) ||
-                        !_pcbaInBoard(x,y+1,_pcbaShape) ||
-                        !_pcbaInBoard(x,y-1,_pcbaShape);
-
-            uint8_t r, g, b;
-            if (edge) {
-                r = PCBA_COL_EDGE_R; g = PCBA_COL_EDGE_G; b = PCBA_COL_EDGE_B;
-            } else {
-                // Subtle grid: brighten pixels where x or y is even
-                bool grid = ((x & 1) == 0) || ((y & 1) == 0);
-                r = grid ? PCBA_COL_MID_R  : PCBA_COL_DARK_R;
-                g = grid ? PCBA_COL_MID_G  : PCBA_COL_DARK_G;
-                b = grid ? PCBA_COL_MID_B  : PCBA_COL_DARK_B;
-            }
-            matrix.drawPixel(x, DRAW_Y(y), matrix.Color(r, g, b));
-        }
+    // ── Draw permanent route trace ────────────────────────────────────────────
+    for (int k = 0; k < _pcbaRtLen; k++) {
+        int x = _pcbaRtX[k], y = _pcbaRtY[k];
+        if (x >= 0 && x < MATRIX_COLS && y >= 0 && y < MATRIX_ROWS)
+            matrix.drawPixel(x, DRAW_Y(y),
+                matrix.Color(PCBA_COL_TRACE_R, PCBA_COL_TRACE_G, PCBA_COL_TRACE_B));
     }
 
-    // ── Draw route highlights (dim trace lines) ───────────────────────────────
-    // Render a very subtle brightening along each route so the paths are
-    // barely visible as PCB traces even when no spark is on them.
-    for (int r = 0; r < _pcbaNumRoutes; r++) {
-        PcbaRoute& rt = _pcbaRoutes[r];
-        for (int k = 0; k < rt.len; k++) {
-            int x = rt.px[k], y = rt.py[k];
-            if (x < 0 || x >= MATRIX_COLS || y < 0 || y >= MATRIX_ROWS) continue;
-            // Brighten trace pixel slightly above substrate
-            matrix.drawPixel(x, DRAW_Y(y), matrix.Color(0, 105, 32));
-        }
-    }
-
-    // ── Draw sparks (tail first, head last) ───────────────────────────────────
-    // Pre-build a frame buffer so multiple sparks on the same pixel
-    // take the brightest value (additive-ish).
-    static uint8_t _pcbaFbR[8][8], _pcbaFbG[8][8], _pcbaFbB[8][8];
-    memset(_pcbaFbR, 0, sizeof(_pcbaFbR));
-    memset(_pcbaFbG, 0, sizeof(_pcbaFbG));
-    memset(_pcbaFbB, 0, sizeof(_pcbaFbB));
+    // ── Build spark frame buffer ──────────────────────────────────────────────
+    static uint8_t fbR[8][8], fbG[8][8], fbB[8][8];
+    memset(fbR, 0, sizeof(fbR));
+    memset(fbG, 0, sizeof(fbG));
+    memset(fbB, 0, sizeof(fbB));
 
     for (int i = 0; i < PCBA_MAX_SPARKS; i++) {
         PcbaSpark& s = _pcbaSparks[i];
         if (!s.active) continue;
-        PcbaRoute& rt = _pcbaRoutes[s.routeIdx];
 
-        // Draw head + tail
         for (int t = 0; t <= PCBA_TAIL_LEN; t++) {
             float tp = s.pos - (float)t;
             if (tp < 0.0f) break;
 
-            // Interpolate between route waypoints
-            int   wi  = (int)tp;
+            // Interpolate pixel position along route
+            int   wi   = (int)tp;
             float frac = tp - (float)wi;
-            if (wi >= rt.len - 1) { wi = rt.len - 2; frac = 1.0f; }
-            wi = (wi < 0) ? 0 : wi;
+            if (wi >= _pcbaRtLen - 1) { wi = _pcbaRtLen - 2; frac = 1.0f; }
+            if (wi < 0) wi = 0;
 
-            float fx = (float)rt.px[wi] + frac * (float)(rt.px[wi+1] - rt.px[wi]);
-            float fy = (float)rt.py[wi] + frac * (float)(rt.py[wi+1] - rt.py[wi]);
-            int   px = (int)roundf(fx);
-            int   py = (int)roundf(fy);
-            if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS) continue;
+            float fx = (float)_pcbaRtX[wi]
+                       + frac * (float)(_pcbaRtX[wi+1] - _pcbaRtX[wi]);
+            float fy = (float)_pcbaRtY[wi]
+                       + frac * (float)(_pcbaRtY[wi+1] - _pcbaRtY[wi]);
+            int px = (int)roundf(fx);
+            int py = (int)roundf(fy);
+            if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS)
+                continue;
 
-            // Brightness: head=255, tail decays exponentially
-            float decay = (t == 0) ? 1.0f
-                        : 1.0f / (1.0f + (float)t * (float)t * 0.38f);
+            uint8_t pr, pg, pb;
 
-            // Colour: head=bright gold, tail fades to amber→dark brown
-            float headBlend = decay; // 1.0 at head, 0 at tip
-            uint8_t pr = (uint8_t)(headBlend * PCBA_HEAD_R + (1.0f-headBlend) * PCBA_TAIL_R);
-            uint8_t pg = (uint8_t)(headBlend * PCBA_HEAD_G + (1.0f-headBlend) * PCBA_TAIL_G);
-            uint8_t pb = (uint8_t)(headBlend * PCBA_HEAD_B + (1.0f-headBlend) * PCBA_TAIL_B);
-            pr = (uint8_t)((float)pr * decay);
-            pg = (uint8_t)((float)pg * decay);
-            pb = (uint8_t)((float)pb * decay);
+            if (t == 0) {
+                // ── Head: single white pixel, flickers 10%–100% per frame ──────
+                uint8_t bri = PCBA_HEAD_MIN
+                              + random8(PCBA_HEAD_MAX - PCBA_HEAD_MIN + 1);
+                pr = bri; pg = bri; pb = bri;
+            } else {
+                // ── Tail: piecewise gradient, broad gold zone ─────────────────
+                // tn: 0.0 = just behind head, 1.0 = tip
+                float tn = (float)t / (float)PCBA_TAIL_LEN;
 
-            // Accumulate — take max per channel so sparks don't cancel
-            if (pr > _pcbaFbR[px][py]) _pcbaFbR[px][py] = pr;
-            if (pg > _pcbaFbG[px][py]) _pcbaFbG[px][py] = pg;
-            if (pb > _pcbaFbB[px][py]) _pcbaFbB[px][py] = pb;
+                // Brightness: near-full for first 60%, then linear fade to 0
+                float bri;
+                if (tn < 0.60f) {
+                    bri = 1.0f - tn * 0.40f;   // 100% → 76% over first 60%
+                } else {
+                    bri = 0.76f * (1.0f - (tn - 0.60f) / 0.40f); // 76% → 0
+                }
+
+                // Colour zones (amber zone compressed to 70–85%):
+                //  0%–70%  : white (255,255,255) → gold  (PCBA_GOLD)
+                //  70%–85% : gold  → amber (PCBA_AMBER)  ← narrow
+                //  85%–100%: amber → trace green (PCBA_TIP)
+                float cr, cg, cb;
+                if (tn < 0.70f) {
+                    float f = tn / 0.70f;
+                    cr = 255.0f + f * (PCBA_GOLD_R - 255.0f);
+                    cg = 255.0f + f * (PCBA_GOLD_G - 255.0f);
+                    cb = 255.0f + f * (PCBA_GOLD_B - 255.0f);
+                } else if (tn < 0.85f) {
+                    float f = (tn - 0.70f) / 0.15f;
+                    cr = PCBA_GOLD_R  + f * (PCBA_AMBER_R - PCBA_GOLD_R);
+                    cg = PCBA_GOLD_G  + f * (PCBA_AMBER_G - PCBA_GOLD_G);
+                    cb = PCBA_GOLD_B  + f * (PCBA_AMBER_B - PCBA_GOLD_B);
+                } else {
+                    float f = (tn - 0.85f) / 0.15f;
+                    cr = PCBA_AMBER_R + f * (PCBA_TIP_R - PCBA_AMBER_R);
+                    cg = PCBA_AMBER_G + f * (PCBA_TIP_G - PCBA_AMBER_G);
+                    cb = PCBA_AMBER_B + f * (PCBA_TIP_B - PCBA_AMBER_B);
+                }
+
+                pr = (uint8_t)(cr * bri);
+                pg = (uint8_t)(cg * bri);
+                pb = (uint8_t)(cb * bri);
+            }
+
+            // Per-channel max — sparks bloom, don't cancel
+            if (pr > fbR[px][py]) fbR[px][py] = pr;
+            if (pg > fbG[px][py]) fbG[px][py] = pg;
+            if (pb > fbB[px][py]) fbB[px][py] = pb;
         }
     }
 
-    // Composite spark buffer onto matrix (skip zero pixels — board shows through)
+    // Composite spark buffer over board
     for (int y = 0; y < MATRIX_ROWS; y++)
         for (int x = 0; x < MATRIX_COLS; x++)
-            if (_pcbaFbR[x][y] || _pcbaFbG[x][y] || _pcbaFbB[x][y])
+            if (fbR[x][y] || fbG[x][y] || fbB[x][y])
                 matrix.drawPixel(x, DRAW_Y(y),
-                    matrix.Color(_pcbaFbR[x][y], _pcbaFbG[x][y], _pcbaFbB[x][y]));
+                    matrix.Color(fbR[x][y], fbG[x][y], fbB[x][y]));
 }
+
 
 // =============================================================================
 // MODE_WISP — Will-o'-the-wisp
@@ -2533,9 +2556,340 @@ static void renderWisp() {
     }
 }
 
+
+// =============================================================================
+// MODE_ATOM — Bohr Atom Model
+//
+// Architecture
+// ------------
+//   Up to ATOM_MAX_ATOMS atoms, each with an element (H or He), a nucleus
+//   rendered as hard pixel stamps, and electrons on precessing elliptical orbits.
+//
+//   Ghost tails
+//   -----------
+//   Each electron carries a tail of ATOM_TAIL_STEPS ghost positions sampled
+//   backwards along the orbit at ATOM_TAIL_DTHETA radians per step.  The head
+//   is drawn at full brightness; each tail step scales linearly to 0 at the tip.
+//   Head brightness is 10× the first tail step, i.e. the tail runs at ≤10% of
+//   head brightness (head is 90% brighter than the ghost trail).
+//
+//   Depth cue: both head and each tail pixel are dimmed when "behind" the nucleus
+//   (sin(θ)·sin(planeAngle) < 0), giving a 3-D passing-behind-the-nucleus look.
+//
+//   All electrons are the same blue.  Speed is ATOM_ORBIT_SPEED rad/frame.
+// =============================================================================
+
+// ── Master parameters ─────────────────────────────────────────────────────────
+#define ATOM_NUM_ATOMS          1    // 1, 2, or 3 atoms
+#define ATOM_ELEMENT            2    // 1=H  2=He
+
+// ── Electron orbit tuning ─────────────────────────────────────────────────────
+#define ATOM_ORBIT_RADIUS     2.8f   // orbital radius (pixels)
+#define ATOM_ORBIT_SPEED      0.38f  // angular speed (rad/frame) — fast
+#define ATOM_ORBIT_SPEED_VAR  0.04f  // ± per-electron variation
+#define ATOM_PRECESS_SPEED    0.012f // plane-precession rate (rad/frame)
+#define ATOM_PRECESS_VAR      0.005f // ± variation
+
+// ── Ghost tail ────────────────────────────────────────────────────────────────
+#define ATOM_TAIL_STEPS       18     // number of tail ghost pixels
+#define ATOM_TAIL_DTHETA      0.18f  // angle step between tail samples (radians)
+// Head is drawn at ATOM_HEAD_BRI; tail step k=1 is at 45% of head brightness,
+// fading to 0 at the tip.  Tail pixels near the head are tinted toward white.
+#define ATOM_HEAD_BRI        255     // head brightness (0–255)
+
+// ── Beat response ─────────────────────────────────────────────────────────────
+#define ATOM_BEAT_SURGE       1.6f
+#define ATOM_BEAT_DECAY       0.90f
+#define ATOM_NUCLEUS_FLASH    180
+#define ATOM_NUCLEUS_FDECAY   0.82f
+
+// ── Drift (stubbed) ───────────────────────────────────────────────────────────
+#define ATOM_DRIFT_ENABLE     0
+#define ATOM_DRIFT_RADIUS     0.0f
+#define ATOM_DRIFT_FREQ_A     0.0071f
+#define ATOM_DRIFT_FREQ_B     0.0113f
+
+// ── Colours ───────────────────────────────────────────────────────────────────
+#define ATOM_PROTON_R   220
+#define ATOM_PROTON_G    30
+#define ATOM_PROTON_B    20
+#define ATOM_NEUTRON_R  200
+#define ATOM_NEUTRON_G  200
+#define ATOM_NEUTRON_B  200
+// All electrons: blue
+#define ATOM_ELEC_R      30
+#define ATOM_ELEC_G      80
+#define ATOM_ELEC_B     255
+
+// ── Element definitions ───────────────────────────────────────────────────────
+struct AtomNucleonPx { int8_t dx, dy; uint8_t type; };
+
+static const AtomNucleonPx _atomNucH[] = {
+    {0, 0, 0},
+};
+static const AtomNucleonPx _atomNucHe[] = {
+    {0, 0, 0},  {1, 0, 1},
+    {0, 1, 1},  {1, 1, 0},
+};
+
+struct AtomElement {
+    uint8_t protons, electrons;
+    const AtomNucleonPx* nucPx;
+    uint8_t nucLen;
+    float   nucOffX, nucOffY;
+};
+
+static const AtomElement _atomElements[2] = {
+    { 1, 1, _atomNucH,  1, 0.0f, 0.0f },
+    { 2, 2, _atomNucHe, 4, 0.5f, 0.5f },
+};
+
+// ── Per-electron state ────────────────────────────────────────────────────────
+#define ATOM_MAX_ELECTRONS  2
+
+struct AtomElectron {
+    float theta;
+    float angSpd;
+    float planeAngle;
+    float precessSpd;
+    float speedBoost;
+};
+
+// ── Per-atom state ────────────────────────────────────────────────────────────
+#define ATOM_MAX_ATOMS_CAP  3
+
+struct AtomState {
+    float        cx, cy;
+    float        driftT;
+    float        nucleusFlash;
+    AtomElectron elec[ATOM_MAX_ELECTRONS];
+    uint8_t      numElec;
+};
+
+static AtomState _atoms[ATOM_MAX_ATOMS_CAP];
+
+// ── Helper ────────────────────────────────────────────────────────────────────
+static inline float _atomRandF(float lo, float hi) {
+    return lo + ((float)random8() / 255.0f) * (hi - lo);
+}
+
+// ── Depth cue helper ──────────────────────────────────────────────────────────
+// Returns brightness multiplier: full (1.0) when in front, dimmer when behind.
+static inline float _atomDepth(float theta, float planeAngle) {
+    float d = sinf(theta) * sinf(planeAngle);
+    return (d < 0.0f) ? (0.55f - d * 0.45f) : 1.0f;
+    // behind: 0.55 + 0.45*|d|, never below 0.55; front: 1.0
+}
+
+// ── Init one atom ─────────────────────────────────────────────────────────────
+static void _atomInitOne(AtomState& a, float cx, float cy) {
+    a.cx           = cx;
+    a.cy           = cy;
+    a.driftT       = _atomRandF(0.0f, 62.83f);
+    a.nucleusFlash = 0.0f;
+
+    const AtomElement& el = _atomElements[ATOM_ELEMENT - 1];
+    a.numElec = el.electrons;
+
+    for (int e = 0; e < a.numElec; e++) {
+        a.elec[e].theta      = (float)e * (6.28318f / (float)a.numElec)
+                               + _atomRandF(0.0f, 6.28318f);
+        float spd            = ATOM_ORBIT_SPEED
+                               + _atomRandF(-ATOM_ORBIT_SPEED_VAR,
+                                             ATOM_ORBIT_SPEED_VAR);
+        // Alternate CW/CCW so electrons chase each other on opposite arcs
+        a.elec[e].angSpd     = (e % 2 == 0) ? spd : -spd;
+        a.elec[e].planeAngle = _atomRandF(0.0f, 6.28318f);
+        float pspd           = ATOM_PRECESS_SPEED
+                               + _atomRandF(-ATOM_PRECESS_VAR, ATOM_PRECESS_VAR);
+        a.elec[e].precessSpd = (e % 2 == 0) ? pspd : -pspd;
+        a.elec[e].speedBoost = 1.0f;
+    }
+}
+
+// ── Init all atoms ────────────────────────────────────────────────────────────
+static void _atomInit() {
+    float cx = (float)MATRIX_COLS * 0.5f - 0.5f;
+    float cy = (float)MATRIX_ROWS * 0.5f - 0.5f;
+
+    int n = ATOM_NUM_ATOMS;
+    if (n < 1) n = 1;
+    if (n > ATOM_MAX_ATOMS_CAP) n = ATOM_MAX_ATOMS_CAP;
+
+    static const float _offX[3][3] = {
+        { 0.0f,  0.0f,  0.0f },
+        {-1.8f,  1.8f,  0.0f },
+        { 0.0f, -2.0f,  2.0f },
+    };
+    static const float _offY[3][3] = {
+        { 0.0f,  0.0f,  0.0f },
+        { 0.0f,  0.0f,  0.0f },
+        {-2.0f,  1.4f,  1.4f },
+    };
+
+    for (int i = 0; i < n; i++)
+        _atomInitOne(_atoms[i],
+                     cx + _offX[n-1][i],
+                     cy + _offY[n-1][i]);
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+static void renderAtom() {
+    int n = ATOM_NUM_ATOMS;
+    if (n < 1) n = 1;
+    if (n > ATOM_MAX_ATOMS_CAP) n = ATOM_MAX_ATOMS_CAP;
+
+    const AtomElement& el = _atomElements[ATOM_ELEMENT - 1];
+
+    // ── Beat ──────────────────────────────────────────────────────────────────
+    if (beatFired) {
+        for (int i = 0; i < n; i++) {
+            _atoms[i].nucleusFlash = (float)ATOM_NUCLEUS_FLASH;
+            for (int e = 0; e < _atoms[i].numElec; e++)
+                _atoms[i].elec[e].speedBoost = ATOM_BEAT_SURGE;
+        }
+    }
+
+    // ── Update ────────────────────────────────────────────────────────────────
+    for (int i = 0; i < n; i++) {
+        AtomState& a = _atoms[i];
+#if ATOM_DRIFT_ENABLE
+        float matCX = (float)MATRIX_COLS * 0.5f - 0.5f;
+        float matCY = (float)MATRIX_ROWS * 0.5f - 0.5f;
+        a.cx = matCX + sinf(a.driftT * ATOM_DRIFT_FREQ_A) * ATOM_DRIFT_RADIUS;
+        a.cy = matCY + sinf(a.driftT * ATOM_DRIFT_FREQ_B) * ATOM_DRIFT_RADIUS;
+#endif
+        a.driftT += 1.0f;
+        if (a.nucleusFlash > 0.5f) a.nucleusFlash *= ATOM_NUCLEUS_FDECAY;
+        else a.nucleusFlash = 0.0f;
+
+        for (int e = 0; e < a.numElec; e++) {
+            AtomElectron& el2 = a.elec[e];
+            if (el2.speedBoost > 1.01f) el2.speedBoost *= ATOM_BEAT_DECAY;
+            else el2.speedBoost = 1.0f;
+            el2.theta      += el2.angSpd * el2.speedBoost;
+            el2.planeAngle += el2.precessSpd;
+        }
+    }
+
+    // ── Draw ──────────────────────────────────────────────────────────────────
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+
+    // Use a per-pixel accumulation buffer so overlapping tails add correctly
+    // and the nucleus (drawn last) always wins.
+    static uint8_t fbR[8][8], fbG[8][8], fbB[8][8];
+    memset(fbR, 0, sizeof(fbR));
+    memset(fbG, 0, sizeof(fbG));
+    memset(fbB, 0, sizeof(fbB));
+
+    for (int i = 0; i < n; i++) {
+        AtomState& a = _atoms[i];
+
+        for (int e = 0; e < a.numElec; e++) {
+            const AtomElectron& el2 = a.elec[e];
+
+            // Draw tail first (oldest → newest), then head on top
+            for (int k = ATOM_TAIL_STEPS; k >= 0; k--) {
+                // k=0 is the head; k=ATOM_TAIL_STEPS is the tip
+                float sampleTheta = el2.theta - (float)k * ATOM_TAIL_DTHETA
+                                    * (el2.angSpd >= 0.0f ? 1.0f : -1.0f);
+
+                float ex = a.cx + cosf(sampleTheta) * ATOM_ORBIT_RADIUS;
+                float ey = a.cy + sinf(sampleTheta) * ATOM_ORBIT_RADIUS
+                                * cosf(el2.planeAngle);
+
+                int px = (int)roundf(ex);
+                int py = (int)roundf(ey);
+                if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS)
+                    continue;
+
+                // Brightness: head = ATOM_HEAD_BRI; tail fades from 45% at k=1
+                // down to 0 at k=ATOM_TAIL_STEPS (much brighter ghost trail).
+                // Colour: tail pixels near the head are tinted toward white,
+                // fading back to pure blue toward the tip.
+                //   whiteness = (1 - k/TAIL_STEPS)^1.5  → strong near head
+                float bri;
+                float whiteness = 0.0f;
+                if (k == 0) {
+                    bri      = (float)ATOM_HEAD_BRI;
+                    whiteness = 0.0f; // head stays pure colour
+                } else {
+                    float tailFrac = 1.0f - (float)k / (float)ATOM_TAIL_STEPS;
+                    bri      = (float)ATOM_HEAD_BRI * 0.45f * tailFrac;
+                    // whiteness strongest just behind head, zero at tip
+                    whiteness = tailFrac * tailFrac;  // quadratic: 1→0
+                }
+
+                // Depth cue
+                float depth = _atomDepth(sampleTheta, el2.planeAngle);
+                bri *= depth;
+
+                // Base colour scaled by brightness, then blend toward white
+                float br_f = ATOM_ELEC_R * bri / 255.0f;
+                float bg_f = ATOM_ELEC_G * bri / 255.0f;
+                float bb_f = ATOM_ELEC_B * bri / 255.0f;
+                // White contribution: add (bri * whiteness) to each channel, cap 255
+                float wc   = bri * whiteness * 0.72f; // 0.72 keeps it tinted, not stark
+                uint8_t br = (uint8_t)fminf(255.0f, br_f + wc);
+                uint8_t bg = (uint8_t)fminf(255.0f, bg_f + wc);
+                uint8_t bb = (uint8_t)fminf(255.0f, bb_f + wc);
+
+                // Accumulate: take max per channel so head wins over tail
+                if (br > fbR[px][py]) fbR[px][py] = br;
+                if (bg > fbG[px][py]) fbG[px][py] = bg;
+                if (bb > fbB[px][py]) fbB[px][py] = bb;
+            }
+        }
+
+        // ── Nucleus — drawn over electron buffer ──────────────────────────────
+        float flash = a.nucleusFlash / (float)ATOM_NUCLEUS_FLASH;
+
+        for (int k = 0; k < el.nucLen; k++) {
+            int px = (int)roundf(a.cx - el.nucOffX + el.nucPx[k].dx);
+            int py = (int)roundf(a.cy - el.nucOffY + el.nucPx[k].dy);
+            if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS)
+                continue;
+
+            uint8_t r, g, b;
+            if (el.nucPx[k].type == 0) {
+                r = (uint8_t)(ATOM_PROTON_R  + flash * (255 - ATOM_PROTON_R));
+                g = (uint8_t)(ATOM_PROTON_G  + flash * (255 - ATOM_PROTON_G));
+                b = (uint8_t)(ATOM_PROTON_B  + flash * (255 - ATOM_PROTON_B));
+            } else {
+                r = (uint8_t)fminf(255.0f, ATOM_NEUTRON_R + flash * 55.0f);
+                g = (uint8_t)fminf(255.0f, ATOM_NEUTRON_G + flash * 55.0f);
+                b = (uint8_t)fminf(255.0f, ATOM_NEUTRON_B + flash * 55.0f);
+            }
+            // Nucleus always overrides electron buffer
+            fbR[px][py] = r;
+            fbG[px][py] = g;
+            fbB[px][py] = b;
+        }
+    }
+
+    // Flush frame buffer to matrix
+    for (int y = 0; y < MATRIX_ROWS; y++)
+        for (int x = 0; x < MATRIX_COLS; x++)
+            matrix.drawPixel(x, DRAW_Y(y),
+                matrix.Color(fbR[x][y], fbG[x][y], fbB[x][y]));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Init + Update — always compiled
 // ═════════════════════════════════════════════════════════════════════════════
+
+// ── Mode name table (auto-generated from VISUALIZER_MODE_TABLE) ──────────────
+#define _VMODE_X_NAME(id, desc) desc,
+static const char* const _vModeNames[] = { VISUALIZER_MODE_TABLE(_VMODE_X_NAME) };
+#undef _VMODE_X_NAME
+
+uint8_t visualizerModeCount() { return (uint8_t)_VMODE_COUNT; }
+
+const char* visualizerModeName(uint8_t mode) {
+    if (mode < _VMODE_COUNT) return _vModeNames[mode];
+    return "Unknown";
+}
 
 void visualizerInit() {
     matrix.begin();
@@ -2563,6 +2917,7 @@ void visualizerInit() {
     _geoInit();
     _wispInit();
     _pcbaInit();
+    _atomInit();
 }
 
 // ── Runtime mode state (variable declared near top of file) ─────────────────
@@ -2596,6 +2951,7 @@ void visualizerSetMode(uint8_t mode) {
     if (mode == MODE_GEOMETRIC) _geoInit();
     if (mode == MODE_WISP)      _wispInit();
     if (mode == MODE_PCBA)      _pcbaInit();
+    if (mode == MODE_ATOM)      _atomInit();
     matrix.fillScreen(0);
     matrix.show();
 }
@@ -2636,6 +2992,7 @@ void visualizerUpdate() {
         case MODE_GEOMETRIC:            renderGeometric();  break;
         case MODE_WISP:                 renderWisp();       break;
         case MODE_PCBA:                 renderPcba();       break;
+        case MODE_ATOM:                 renderAtom();       break;
         default:                        renderSpectrum();   break;
     }
 
