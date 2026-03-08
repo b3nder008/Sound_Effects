@@ -38,7 +38,15 @@ static Adafruit_NeoMatrix matrix(
 );
 
 // ─── Global brightness ───────────────────────────────────────────────────────
-#define BRIGHTNESS  100   // base brightness 0–255
+// BRIGHTNESS resolves to the button-controlled level when buttons are
+// enabled, or a fixed default when BUTTONS_ENABLED 0. Every render
+// function calls matrix.setBrightness(BRIGHTNESS) — no other changes needed.
+#include "buttons.h"
+#if BUTTONS_ENABLED
+  #define BRIGHTNESS  buttonsBrightness()
+#else
+  #define BRIGHTNESS  150   // fixed default when buttons disabled
+#endif
 
 // ─── Beat detector ───────────────────────────────────────────────────────────
 // Shared by all modes. Outputs:
@@ -61,6 +69,11 @@ static uint8_t _beatCooldown  = 0;
 static uint8_t _beatPulseFrames = 0;  // counts down for spectrum flash
 static float   beatEnergy     = 0.0f; // global — used by all render functions
 static bool    beatFired      = false; // global — true for one frame
+
+// ─── Runtime mode ────────────────────────────────────────────────────────────
+// Declared here so all render functions can reference it.
+// Defined and managed by visualizerSetMode() near the bottom of this file.
+static uint8_t _runtimeMode = ACTIVE_MODE;
 
 static void beatDetect() {
     float raw = bandMagnitude[BEAT_BAND];
@@ -116,7 +129,6 @@ static void dimAll(CRGB* leds, uint8_t value) {
 // Unchanged from the original working implementation.
 // Beat modulation: global brightness flash on kick.
 // ═════════════════════════════════════════════════════════════════════════════
-#if ACTIVE_MODE == MODE_SPECTRUM
 
 // Tuning
 #define PEAK_HOLD_FRAMES   12
@@ -233,7 +245,6 @@ static void renderSpectrum() {
 // MODE_FIRE — Fire2012WithPalette.h (exact port)
 // Beat modulation: increases sparking probability.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_FIRE
 
 #define _FIRE_COOLING   55
 #define _FIRE_SPARKING  50
@@ -275,7 +286,6 @@ static void renderFire() {
 // MODE_TORCH / MODE_TORCH2 — Torch.h / Torch2.h (exact port)
 // Beat modulation: increases spark probability.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_TORCH || ACTIVE_MODE == MODE_TORCH2
 
 static const uint8_t _energymap[32] = {
     0,64,96,112,128,144,152,160,168,176,184,184,192,200,200,208,
@@ -305,11 +315,7 @@ static void renderTorch() {
     const uint8_t  RED_BIAS   = 10,  GREEN_BIAS = 0,  BLUE_BIAS = 0;
     const int      RED_EN     = 180, BLUE_EN    = 0;
     // Torch2 has green_energy=80; Torch has green_energy=20
-#if ACTIVE_MODE == MODE_TORCH2
-    const int GREEN_EN = 80;
-#else
-    const int GREEN_EN = 20;
-#endif
+    const int GREEN_EN = (_runtimeMode == MODE_TORCH2) ? 80 : 20;
     const uint8_t RED_BG = 0, GREEN_BG = 0, BLUE_BG = 0;
 
     // Beat boosts spark probability
@@ -391,7 +397,6 @@ static void renderTorch() {
 // MODE_PULSE — Pulse.h (exact port)
 // Beat modulation: new pulse triggered immediately on beat.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_PULSE
 
 static CRGB _pulseLeds[NUM_LEDS];
 static CRGBPalette16 _pulsePal;
@@ -446,7 +451,6 @@ static void renderPulse() {
 // MODE_WAVE — Wave.h (exact port)
 // Beat modulation: hue jump and theta kick on beat.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_WAVE
 
 static CRGB _waveLeds[NUM_LEDS];
 static CRGBPalette16 _wavePal;
@@ -506,14 +510,6 @@ static void renderWave() {
 // NOISE MODES — Noise.h (exact port, all 8 variants)
 // Beat modulation: noise speed boost proportional to beatEnergy.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_RAINBOW_NOISE      || \
-      ACTIVE_MODE == MODE_RAINBOW_STRIPE_NOISE || \
-      ACTIVE_MODE == MODE_PARTY_NOISE        || \
-      ACTIVE_MODE == MODE_FOREST_NOISE       || \
-      ACTIVE_MODE == MODE_CLOUD_NOISE        || \
-      ACTIVE_MODE == MODE_FIRE_NOISE         || \
-      ACTIVE_MODE == MODE_LAVA_NOISE         || \
-      ACTIVE_MODE == MODE_OCEAN_NOISE
 
 static CRGB _noiseLeds[NUM_LEDS];
 
@@ -568,31 +564,35 @@ static void _mapNoiseToLeds(const CRGBPalette16& pal, uint8_t hueReduce = 0) {
 
 static void renderNoise() {
     // Per-mode parameters — exact values from Noise.h
-#if   ACTIVE_MODE == MODE_RAINBOW_NOISE
-    _nSpeedX=9; _nSpeedY=0; _nSpeedZ=0; _nScale=30; _nColorLoop=0;
-    const CRGBPalette16& pal = RainbowColors_p; uint8_t hr = 0;
-#elif ACTIVE_MODE == MODE_RAINBOW_STRIPE_NOISE
-    _nSpeedX=9; _nSpeedY=0; _nSpeedZ=0; _nScale=20; _nColorLoop=0;
-    const CRGBPalette16& pal = RainbowStripeColors_p; uint8_t hr = 0;
-#elif ACTIVE_MODE == MODE_PARTY_NOISE
-    _nSpeedX=9; _nSpeedY=0; _nSpeedZ=0; _nScale=30; _nColorLoop=0;
-    const CRGBPalette16& pal = PartyColors_p; uint8_t hr = 0;
-#elif ACTIVE_MODE == MODE_FOREST_NOISE
-    _nSpeedX=9; _nSpeedY=0; _nSpeedZ=0; _nScale=120; _nColorLoop=0;
-    const CRGBPalette16& pal = ForestColors_p; uint8_t hr = 0;
-#elif ACTIVE_MODE == MODE_CLOUD_NOISE
-    _nSpeedX=9; _nSpeedY=0; _nSpeedZ=0; _nScale=30; _nColorLoop=0;
-    const CRGBPalette16& pal = CloudColors_p; uint8_t hr = 0;
-#elif ACTIVE_MODE == MODE_FIRE_NOISE
-    _nSpeedX=8; _nSpeedY=0; _nSpeedZ=8; _nScale=50; _nColorLoop=0;
-    const CRGBPalette16& pal = HeatColors_p; uint8_t hr = 60;
-#elif ACTIVE_MODE == MODE_LAVA_NOISE
-    _nSpeedX=32; _nSpeedY=0; _nSpeedZ=16; _nScale=50; _nColorLoop=0;
-    const CRGBPalette16& pal = LavaColors_p; uint8_t hr = 0;
-#elif ACTIVE_MODE == MODE_OCEAN_NOISE
-    _nSpeedX=9; _nSpeedY=0; _nSpeedZ=0; _nScale=90; _nColorLoop=0;
-    const CRGBPalette16& pal = OceanColors_p; uint8_t hr = 0;
-#endif
+    const CRGBPalette16* palPtr = &RainbowColors_p;
+    uint8_t hr = 0;
+    switch (_runtimeMode) {
+        case MODE_RAINBOW_NOISE:
+            _nSpeedX=9;  _nSpeedY=0; _nSpeedZ=0;  _nScale=30;  _nColorLoop=0;
+            palPtr=&RainbowColors_p;       hr=0;  break;
+        case MODE_RAINBOW_STRIPE_NOISE:
+            _nSpeedX=9;  _nSpeedY=0; _nSpeedZ=0;  _nScale=20;  _nColorLoop=0;
+            palPtr=&RainbowStripeColors_p; hr=0;  break;
+        case MODE_PARTY_NOISE:
+            _nSpeedX=9;  _nSpeedY=0; _nSpeedZ=0;  _nScale=30;  _nColorLoop=0;
+            palPtr=&PartyColors_p;         hr=0;  break;
+        case MODE_FOREST_NOISE:
+            _nSpeedX=9;  _nSpeedY=0; _nSpeedZ=0;  _nScale=120; _nColorLoop=0;
+            palPtr=&ForestColors_p;        hr=0;  break;
+        case MODE_CLOUD_NOISE:
+            _nSpeedX=9;  _nSpeedY=0; _nSpeedZ=0;  _nScale=30;  _nColorLoop=0;
+            palPtr=&CloudColors_p;         hr=0;  break;
+        case MODE_FIRE_NOISE:
+            _nSpeedX=8;  _nSpeedY=0; _nSpeedZ=8;  _nScale=50;  _nColorLoop=0;
+            palPtr=&HeatColors_p;          hr=60; break;
+        case MODE_LAVA_NOISE:
+            _nSpeedX=32; _nSpeedY=0; _nSpeedZ=16; _nScale=50;  _nColorLoop=0;
+            palPtr=&LavaColors_p;          hr=0;  break;
+        case MODE_OCEAN_NOISE:
+        default:
+            _nSpeedX=9;  _nSpeedY=0; _nSpeedZ=0;  _nScale=90;  _nColorLoop=0;
+            palPtr=&OceanColors_p;         hr=0;  break;
+    }
 
     // Beat: temporarily speed up noise drift
     if (beatEnergy > 0.0f) {
@@ -601,7 +601,7 @@ static void renderNoise() {
     }
 
     _fillNoise8();
-    _mapNoiseToLeds(pal, hr);
+    _mapNoiseToLeds(*palPtr, hr);
 
     matrix.setBrightness(BRIGHTNESS);
     flushLeds(_noiseLeds);
@@ -611,7 +611,6 @@ static void renderNoise() {
 // MODE_CONFETTI — torchv2.ino confetti() (exact port)
 // Beat modulation: extra splats on beat.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_CONFETTI
 
 static CRGB          _confLeds[NUM_LEDS];
 static CRGBPalette16 _confPal;
@@ -639,7 +638,6 @@ static void renderConfetti() {
 // MODE_JUGGLE — torchv2.ino juggle() (exact port)
 // Beat modulation: dot count or speed can increase on beat if desired.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_JUGGLE
 
 static CRGB _juggleLeds[NUM_LEDS];
 
@@ -660,7 +658,6 @@ static void renderJuggle() {
 // MODE_SINELON — torchv2.ino sinelon() (exact port)
 // Beat modulation: hue jump on beat.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_SINELON
 
 static CRGB    _sinLeds[NUM_LEDS];
 static uint8_t _sinGHue = 0;
@@ -686,7 +683,6 @@ static void renderSinelon() {
 // MODE_PRIDE — torchv2.ino pride() / Pride2015 by Mark Kriegsman (exact port)
 // Beat modulation: none needed — beatsin88 already drives animation.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_PRIDE
 
 static CRGB _prideLeds[NUM_LEDS];
 
@@ -729,7 +725,6 @@ static void renderPride() {
 // MODE_COLOR_WAVES — torchv2.ino colorwaves() (exact port)
 // Beat modulation: none needed — beatsin88 already drives animation.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_COLOR_WAVES
 
 static CRGB _cwLeds[NUM_LEDS];
 
@@ -785,9 +780,6 @@ static void renderColorWaves() {
 // torchv2.ino rainbow(), rainbowWithGlitter(), hueCycle() (exact ports)
 // Beat modulation: extra glitter burst on beat; hue jump for hue cycle.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_RAINBOW      || \
-      ACTIVE_MODE == MODE_RAINBOW_GLITTER || \
-      ACTIVE_MODE == MODE_HUE_CYCLE
 
 static CRGB    _simLeds[NUM_LEDS];
 static uint8_t _simGHue = 0;
@@ -796,21 +788,19 @@ static void renderSimple() {
     EVERY_N_MILLISECONDS(20) { _simGHue++; }
     if (beatFired) _simGHue += 16;
 
-#if ACTIVE_MODE == MODE_RAINBOW
-    fill_rainbow(_simLeds, NUM_LEDS, _simGHue, 1);
-
-#elif ACTIVE_MODE == MODE_RAINBOW_GLITTER
-    fill_rainbow(_simLeds, NUM_LEDS, _simGHue, 1);
-    if (random8() < 80 || beatFired)
-        _simLeds[random16(NUM_LEDS)] += CRGB(CRGB::White);
-    if (beatFired) // extra glitter burst on beat
-        for (int i = 0; i < 5; i++)
+    if (_runtimeMode == MODE_RAINBOW) {
+        fill_rainbow(_simLeds, NUM_LEDS, _simGHue, 1);
+    } else if (_runtimeMode == MODE_RAINBOW_GLITTER) {
+        fill_rainbow(_simLeds, NUM_LEDS, _simGHue, 1);
+        if (random8() < 80 || beatFired)
             _simLeds[random16(NUM_LEDS)] += CRGB(CRGB::White);
-
-#elif ACTIVE_MODE == MODE_HUE_CYCLE
-    uint8_t bri = beatFired ? 255 : 200; // brief brightness pop on beat
-    fill_solid(_simLeds, NUM_LEDS, hsv2rgb_rainbow(CHSV(_simGHue, 255, bri)));
-#endif
+        if (beatFired)
+            for (int i = 0; i < 5; i++)
+                _simLeds[random16(NUM_LEDS)] += CRGB(CRGB::White);
+    } else { // MODE_HUE_CYCLE
+        uint8_t bri = beatFired ? 255 : 200;
+        fill_solid(_simLeds, NUM_LEDS, hsv2rgb_rainbow(CHSV(_simGHue, 255, bri)));
+    }
 
     matrix.setBrightness(BRIGHTNESS);
     flushLeds(_simLeds);
@@ -821,8 +811,6 @@ static void renderSimple() {
 // torchv2.ino colortwinkles() (exact port)
 // Beat modulation: density spike on beat.
 // ═════════════════════════════════════════════════════════════════════════════
-#elif ACTIVE_MODE == MODE_CLOUD_TWINKLES || \
-      ACTIVE_MODE == MODE_RAINBOW_TWINKLES
 
 static CRGB    _twLeds[NUM_LEDS];
 static uint8_t _twDirFlags[(NUM_LEDS + 7) / 8];
@@ -856,11 +844,8 @@ static void renderTwinkles() {
     }
 
     uint8_t density = beatFired ? 255 : 200; // beat → sudden burst
-#if ACTIVE_MODE == MODE_CLOUD_TWINKLES
-    const CRGBPalette16& pal = CloudColors_p;
-#else
-    const CRGBPalette16& pal = RainbowColors_p;
-#endif
+    const CRGBPalette16& pal =
+        (_runtimeMode == MODE_CLOUD_TWINKLES) ? CloudColors_p : RainbowColors_p;
     if (random8() < density) {
         int pos = random16(NUM_LEDS);
         if (!_twLeds[pos]) {
@@ -895,7 +880,6 @@ static void renderTwinkles() {
 //   - Beat modulation: a detected beat can trigger an immediate lightning
 //     strike regardless of intensity, giving an audio-reactive flash.
 // =============================================================================
-#elif ACTIVE_MODE == MODE_RAIN
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define RAIN_MAX_STREAKS       12    // simultaneous falling streaks
@@ -1116,7 +1100,6 @@ static void renderRain() {
 //   STAR_SPAWN_RADIUS  -- how close to center new stars spawn (smaller = tighter)
 //   STAR_BEAT_SURGE    -- extra accel multiplier on a beat hit
 // =============================================================================
-#elif ACTIVE_MODE == MODE_STARFIELD
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define STAR_COUNT          18    // number of simultaneous stars
@@ -1302,7 +1285,6 @@ static void renderStarfield() {
 //   Beat modulation: a beat briefly brightens the micro-texture contrast,
 //   producing a subtle shimmer across the whole scene.
 // =============================================================================
-#elif ACTIVE_MODE == MODE_DUNE
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define DUNE_NUM_RIDGES      2      // number of S-curve ridges
@@ -1647,7 +1629,6 @@ static void renderDune() {
 //   Beat modulation
 //     A beat triggers a temporary speed boost on all shapes for ~8 frames.
 // =============================================================================
-#elif ACTIVE_MODE == MODE_GEOMETRIC
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define GEO_NUM_SHAPES     5       // number of simultaneous rectangles
@@ -1887,343 +1868,670 @@ static void renderGeometric() {
 }
 
 
+
+
+
 // =============================================================================
-// MODE_ASTEROIDS -- Asteroids-style drifting rocks with an evasive 3-pixel ship
+// MODE_PCBA — PCB Artwork
 //
 // Architecture
 // ------------
-//   AST_NUM_ROCKS asteroids of varying radii (0-4) drift across the matrix.
-//   Each has a float centre, constant velocity vector (one of 8 directions),
-//   and a greyscale brightness. They wrap at the edges identical to MODE_GEOMETRIC.
+//   Six hand-crafted 8×8 board outlines cycle every PCBA_BOARD_CYCLE_MS ms.
+//   Each outline is a bitmask (one uint8_t per row, bit7=col0).
+//   The board cycles with a hard cut; inside pixels are rendered as dark/mid
+//   green PCB substrate with a faint grid of brighter green traces.
 //
-//   Asteroid shapes are stored as compile-time pixel stamp tables: arrays of
-//   (dx, dy) integer offsets from the centre that approximate circles without
-//   anti-aliasing. Radius 0 = 1 pixel. Radius 4 = ~29 pixels (chunky circle).
+//   Routes are Manhattan paths traced inside the board mask, always starting
+//   from a top-edge pixel and walking downward (occasionally side-stepping).
+//   Between 6 and 10 routes are generated per board. After PCBA_ROUTE_CYCLE_MS
+//   all routes are re-randomised. Routes regenerate automatically on board
+//   change too.
 //
-//   The ship is exactly 3 pixels: a bright nose pixel and two dimmer rear
-//   pixels. Their positions are derived from the ship's integer centre (sx, sy)
-//   and heading direction (0-7, same direction table as MODE_GEOMETRIC).
-//   The ship moves at a fixed speed. Every AST_SHIP_THINK_FRAMES frames the
-//   ship AI evaluates whether its current heading will collide with any asteroid
-//   within AST_SHIP_LOOKAHEAD steps and steers toward the clearest heading.
+//   Sparks — pool of PCBA_MAX_SPARKS structs. Each spark rides one route,
+//   advancing at PCBA_SPARK_SPEED pixels/frame. A burst scheduler fires
+//   bursts of 1–3 sparks per route every PCBA_BURST_GAP frames. The head
+//   pixel is bright gold; a PCBA_TAIL_LEN-pixel ghost tail decays
+//   exponentially from gold → amber → dark brown.
 //
-//   Rendering: black background, asteroids drawn back-to-front (overlapping
-//   freely), ship drawn last so it always appears on top. No anti-aliasing.
-//
-//   Colour: asteroids are grey-scale with slight brightness variation matching
-//   the starfield palette. Ship nose = pure white, rear pixels = dim white.
-//
-//   Beat modulation: beat brightens all asteroids briefly and injects a small
-//   speed surge (same decay pattern as MODE_STARFIELD).
+//   Beat: brief speed surge on all active sparks.
 // =============================================================================
-#elif ACTIVE_MODE == MODE_ASTEROIDS
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
-#define AST_NUM_ROCKS          8    // number of asteroids
-#define AST_SPEED_MIN       0.06f   // slowest asteroid (pixels/frame)
-#define AST_SPEED_MAX       0.22f   // fastest asteroid (pixels/frame)
-#define AST_WRAP_MARGIN      6.0f   // pixels past edge before wrap
-#define AST_SHIP_SPEED      0.18f   // ship movement speed (pixels/frame)
-#define AST_SHIP_THINK_FRAMES  4    // frames between ship AI decisions
-#define AST_SHIP_LOOKAHEAD    14    // steps ahead the AI scans for collisions
-#define AST_BEAT_BRIGHT_BOOST 60    // extra brightness added on beat
-#define AST_BEAT_BRIGHT_DECAY 0.85f // brightness boost decay per frame
-#define AST_BEAT_SPEED_SURGE  1.6f  // speed multiplier on beat
-#define AST_BEAT_SPEED_DECAY  0.90f // speed boost decay per frame
+#define PCBA_MAX_SPARKS        18
+#define PCBA_TAIL_LEN           6    // pixels of ghost tail behind head
+#define PCBA_SPARK_SPEED      0.45f  // base pixels/frame (fast)
+#define PCBA_BURST_GAP_MIN     18    // min frames between bursts on one route
+#define PCBA_BURST_GAP_MAX     45    // max frames between bursts on one route
+#define PCBA_BOARD_CYCLE_MS  14000UL // ms between board shape changes
+#define PCBA_ROUTE_CYCLE_MS  60000UL // ms between route re-randomisation
+#define PCBA_MAX_ROUTES        10    // max routes per board
+#define PCBA_ROUTE_LEN_MIN      5    // minimum route length (pixels)
+#define PCBA_ROUTE_LEN_MAX     14    // maximum route length
+#define PCBA_BEAT_SURGE        1.8f  // speed multiplier on beat
+#define PCBA_BEAT_DECAY        0.88f // surge decay per frame
 
-// ── Direction table (shared with geometric, redefined here) ───────────────────
-// 8 directions: E, SE, S, SW, W, NW, N, NE
-static const float _astDX[8] = { 1, 1, 0,-1,-1,-1, 0, 1 };
-static const float _astDY[8] = { 0, 1, 1, 1, 0,-1,-1,-1 };
-// Pre-normalised diagonal scale
-static const float _astDS[8] = {
-    1.0f, 0.7071f, 1.0f, 0.7071f,
-    1.0f, 0.7071f, 1.0f, 0.7071f
+// ── Colour palette ────────────────────────────────────────────────────────────
+// PCB substrate: dark green
+#define PCBA_COL_DARK_R   0
+#define PCBA_COL_DARK_G  55
+#define PCBA_COL_DARK_B  18
+// PCB trace grid: mid green
+#define PCBA_COL_MID_R    0
+#define PCBA_COL_MID_G   90
+#define PCBA_COL_MID_B   28
+// Board edge highlight: slightly brighter
+#define PCBA_COL_EDGE_R   8
+#define PCBA_COL_EDGE_G  110
+#define PCBA_COL_EDGE_B   35
+// Spark head: bright gold
+#define PCBA_HEAD_R      255
+#define PCBA_HEAD_G      195
+#define PCBA_HEAD_B       10
+// Tail tip: dark amber
+#define PCBA_TAIL_R       60
+#define PCBA_TAIL_G       28
+#define PCBA_TAIL_B        0
+
+// ── Board outline bitmasks ────────────────────────────────────────────────────
+// 6 shapes. Each row byte: bit7 = col 0 (left), bit0 = col 7 (right).
+// Shapes fill 6-7 columns/rows with PCB-plausible outlines.
+// Row order: row 0 = bottom, row 7 = top (matching DRAW_Y convention).
+
+static const uint8_t _pcbaBoards[6][8] = {
+    // Shape 0: full rectangle with top notch (component keepout)
+    { 0b11111111,   // row 0  bottom
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11011011 }, // row 7  top: notches at col1 and col5
+
+    // Shape 1: large rectangle, bottom-left corner cut
+    { 0b00111111,   // row 0  bottom-left 2px cut
+      0b01111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111110 }, // row 7  top: right edge notch
+
+    // Shape 2: D-shape — left side flat, right side has bite taken out centre
+    { 0b11111110,
+      0b11111111,
+      0b11111111,
+      0b11110111,   // centre-right pixel missing
+      0b11111111,
+      0b11111111,
+      0b11111110,
+      0b11111100 },
+
+    // Shape 3: L-shape — upper-right quadrant absent
+    { 0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11110000,   // top half: right half missing
+      0b11110000,
+      0b11110000,
+      0b11110000 },
+
+    // Shape 4: castellated edges top + bottom (mounting pads)
+    { 0b10101010,   // bottom castellations
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b10101010 }, // top castellations
+
+    // Shape 5: plus/cross shape — corners removed
+    { 0b00111100,
+      0b01111110,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b11111111,
+      0b01111110,
+      0b00111100 },
 };
 
-// ── Asteroid pixel stamps ─────────────────────────────────────────────────────
-// Each stamp is a list of (dx, dy) pixel offsets from the centre.
-// Hand-crafted to approximate circles of radius 0-4 with no anti-aliasing.
-// Intentionally rough — real Asteroids looked chunky.
+static inline bool _pcbaInBoard(int x, int y, uint8_t shapeIdx) {
+    if (x < 0 || x > 7 || y < 0 || y > 7) return false;
+    return (_pcbaBoards[shapeIdx][y] >> (7 - x)) & 1;
+}
 
-// Radius 0: single pixel
-static const int8_t _astR0[][2] = { {0,0} };
-
-// Radius 1: single pixel (halved from 3x3 cross)
-static const int8_t _astR1[][2] = {
-    {0,0}
+// ── Route storage ─────────────────────────────────────────────────────────────
+struct PcbaRoute {
+    int8_t  px[PCBA_ROUTE_LEN_MAX]; // x coords
+    int8_t  py[PCBA_ROUTE_LEN_MAX]; // y coords
+    uint8_t len;                     // actual length
+    uint8_t burstTimer;              // frames until next burst launch
+    uint8_t burstRemain;             // sparks left to launch in current burst
+    uint8_t burstSpacing;            // frames between burst members
+    uint8_t burstSpacingTimer;
 };
 
-// Radius 2: 5-pixel cross (halved from 5x5 blob)
-static const int8_t _astR2[][2] = {
-    {0,0},
-    {1,0},{-1,0},{0,1},{0,-1}
+static PcbaRoute _pcbaRoutes[PCBA_MAX_ROUTES];
+static uint8_t   _pcbaNumRoutes = 0;
+static uint8_t   _pcbaShape     = 0;
+
+// ── Spark storage ─────────────────────────────────────────────────────────────
+struct PcbaSpark {
+    float   pos;         // position along route (0..route.len-1)
+    uint8_t routeIdx;
+    float   speed;
+    float   speedBoost;
+    bool    active;
 };
 
-// Radius 3: 9-pixel filled 3x3 (halved from 7x7 circle)
-static const int8_t _astR3[][2] = {
-    {0,0},
-    {1,0},{-1,0},{0,1},{0,-1},
-    {1,1},{-1,1},{1,-1},{-1,-1}
-};
+static PcbaSpark _pcbaSparks[PCBA_MAX_SPARKS];
 
-// Radius 4: 13-pixel circle radius~2 (halved from 9x9 circle)
-static const int8_t _astR4[][2] = {
-    {0,0},
-    {1,0},{-1,0},{0,1},{0,-1},
-    {2,0},{-2,0},{0,2},{0,-2},
-    {1,1},{-1,1},{1,-1},{-1,-1}
-};
-
-#define _AST_R0_LEN  (sizeof(_astR0)/sizeof(_astR0[0]))
-#define _AST_R1_LEN  (sizeof(_astR1)/sizeof(_astR1[0]))
-#define _AST_R2_LEN  (sizeof(_astR2)/sizeof(_astR2[0]))
-#define _AST_R3_LEN  (sizeof(_astR3)/sizeof(_astR3[0]))
-#define _AST_R4_LEN  (sizeof(_astR4)/sizeof(_astR4[0]))
-
-// Pointer + length pair for runtime dispatch
-struct AstStamp { const int8_t (*pts)[2]; uint8_t len; };
-static const AstStamp _astStamps[5] = {
-    { _astR0, _AST_R0_LEN },
-    { _astR1, _AST_R1_LEN },
-    { _astR2, _AST_R2_LEN },
-    { _astR3, _AST_R3_LEN },
-    { _astR4, _AST_R4_LEN },
-};
-
-// ── Ship pixel layout per heading ─────────────────────────────────────────────
-// For each of 8 headings, define 3 pixel offsets from ship centre:
-//   [0] = nose (bright white)
-//   [1] = rear-left  (dim)
-//   [2] = rear-right (dim)
-// Heading indices match _astDX/DY: 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
-static const int8_t _astShipPx[8][3][2] = {
-    // 0 E:  nose right, rears upper-left / lower-left
-    { { 1, 0}, {-1,-1}, {-1, 1} },
-    // 1 SE: nose lower-right, rears upper-left / upper-right  (roughly)
-    { { 1, 1}, {-1, 0}, { 0,-1} },
-    // 2 S:  nose down, rears upper-left / upper-right
-    { { 0, 1}, {-1,-1}, { 1,-1} },
-    // 3 SW: nose lower-left, rears upper-right / upper-left
-    { {-1, 1}, { 1, 0}, { 0,-1} },
-    // 4 W:  nose left, rears upper-right / lower-right
-    { {-1, 0}, { 1,-1}, { 1, 1} },
-    // 5 NW: nose upper-left, rears lower-right / lower-left
-    { {-1,-1}, { 1, 0}, { 0, 1} },
-    // 6 N:  nose up, rears lower-left / lower-right
-    { { 0,-1}, {-1, 1}, { 1, 1} },
-    // 7 NE: nose upper-right, rears lower-left / lower-right
-    { { 1,-1}, {-1, 0}, { 0, 1} },
-};
-
-// ── Rock ──────────────────────────────────────────────────────────────────────
-struct AstRock {
-    float   cx, cy;      // centre (float)
-    uint8_t radius;      // 0-4
-    uint8_t dirIdx;      // movement direction (0-7)
-    float   speed;       // pixels/frame base
-    uint8_t brightness;  // base greyscale brightness 130-240
-    float   brightBoost; // extra from beat (decays to 0)
-    float   speedBoost;  // extra speed multiplier from beat (decays to 1)
-};
-
-// ── Ship ──────────────────────────────────────────────────────────────────────
-struct AstShip {
-    float   cx, cy;      // centre (float)
-    uint8_t heading;     // 0-7
-    int     thinkTimer;  // counts down to next AI decision
-};
-
-// ── State ─────────────────────────────────────────────────────────────────────
-static AstRock  _astRocks[AST_NUM_ROCKS];
-static AstShip  _astShip;
+// ── Timing ────────────────────────────────────────────────────────────────────
+static uint32_t _pcbaBoardAt   = 0;  // millis of last board change
+static uint32_t _pcbaRouteAt   = 0;  // millis of last route regen
+static uint8_t  _pcbaFrameNo   = 0;  // wrapping frame counter
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-static inline float _astRandRange(float lo, float hi) {
-    return lo + ((float)random8() / 255.0f) * (hi - lo);
+static inline uint8_t _pcbaRand8(uint8_t lo, uint8_t hi) {
+    if (hi <= lo) return lo;
+    return lo + random8(hi - lo + 1);
 }
 
-static inline void _astWrap(float& v, float lo, float hi) {
-    float range = hi - lo;
-    if (v < lo) v += range;
-    if (v >= hi) v -= range;
-}
+// ── Route generator ───────────────────────────────────────────────────────────
+// Walks Manhattan-style inside the board mask.
+// Always starts at a top-edge pixel (row 7) and tries to move downward.
+// Direction bias: 60% down, 20% left, 20% right. Never moves up.
+// Aborts (keeps partial path) if stuck for 4 consecutive steps.
 
-static void _astSpawnRock(int i, bool offscreen) {
-    AstRock& r = _astRocks[i];
-    if (offscreen) {
-        // Spawn at a random edge so it drifts into view
-        uint8_t edge = random8(4);
-        float m = AST_WRAP_MARGIN * 0.5f;
-        switch (edge) {
-            case 0: r.cx = _astRandRange(0, MATRIX_COLS); r.cy = -m; break;
-            case 1: r.cx = _astRandRange(0, MATRIX_COLS); r.cy = MATRIX_ROWS + m; break;
-            case 2: r.cx = -m; r.cy = _astRandRange(0, MATRIX_ROWS); break;
-            default: r.cx = MATRIX_COLS + m; r.cy = _astRandRange(0, MATRIX_ROWS); break;
+static void _pcbaGenRoutes(uint8_t shape) {
+    _pcbaNumRoutes = 0;
+    memset(_pcbaRoutes, 0, sizeof(_pcbaRoutes));
+
+    // Collect all top-edge pixels as potential starts
+    int8_t topPx[8]; uint8_t nTop = 0;
+    for (int x = 0; x < 8; x++)
+        if (_pcbaInBoard(x, 7, shape)) topPx[nTop++] = x;
+    if (nTop == 0) return;
+
+    uint8_t target = _pcbaRand8(6, 10); // how many routes to generate
+    uint8_t attempts = 0;
+
+    while (_pcbaNumRoutes < target && _pcbaNumRoutes < PCBA_MAX_ROUTES
+           && attempts < 40) {
+        attempts++;
+
+        // Pick a random top-edge start
+        int8_t sx = topPx[random8(nTop)];
+        int8_t sy = 7; // top row
+
+        PcbaRoute rt;
+        rt.len = 0;
+        rt.px[rt.len] = sx;
+        rt.py[rt.len] = sy;
+        rt.len = 1;
+
+        int8_t cx = sx, cy = sy;
+        uint8_t stuck = 0;
+
+        while (rt.len < PCBA_ROUTE_LEN_MAX && stuck < 4) {
+            // Direction weights: down(2) left(1) right(1) — never up
+            uint8_t roll = random8(4);
+            int8_t ndx, ndy;
+            if      (roll <= 1) { ndx =  0; ndy = -1; } // down (in board coords)
+            else if (roll == 2) { ndx = -1; ndy =  0; } // left
+            else                { ndx =  1; ndy =  0; } // right
+
+            int8_t nx = cx + ndx, ny = cy + ndy;
+            if (!_pcbaInBoard(nx, ny, shape)) { stuck++; continue; }
+
+            // Avoid revisiting very recent pixels (last 3)
+            bool revisit = false;
+            for (int k = (int)rt.len - 1; k >= (int)rt.len - 3 && k >= 0; k--)
+                if (rt.px[k] == nx && rt.py[k] == ny) { revisit = true; break; }
+            if (revisit) { stuck++; continue; }
+
+            stuck = 0;
+            cx = nx; cy = ny;
+            rt.px[rt.len] = cx;
+            rt.py[rt.len] = cy;
+            rt.len++;
         }
-    } else {
-        r.cx = _astRandRange(1, MATRIX_COLS - 1);
-        r.cy = _astRandRange(1, MATRIX_ROWS - 1);
+
+        if (rt.len < PCBA_ROUTE_LEN_MIN) continue;
+
+        rt.burstTimer        = _pcbaRand8(PCBA_BURST_GAP_MIN, PCBA_BURST_GAP_MAX);
+        rt.burstRemain       = 0;
+        rt.burstSpacing      = 5;
+        rt.burstSpacingTimer = 0;
+        _pcbaRoutes[_pcbaNumRoutes++] = rt;
     }
-    r.radius     = random8(5);           // 0-4
-    r.dirIdx     = random8(8);
-    r.speed      = _astRandRange(AST_SPEED_MIN, AST_SPEED_MAX);
-    r.brightness = 130 + random8(110);   // 130-240
-    r.brightBoost = 0.0f;
-    r.speedBoost  = 1.0f;
 }
 
-// Pixel occupancy check: is pixel (px, py) covered by rock i given its stamp?
-static bool _astRockCoversPixel(int i, int px, int py) {
-    AstRock& r = _astRocks[i];
-    int cx = (int)roundf(r.cx);
-    int cy = (int)roundf(r.cy);
-    const AstStamp& st = _astStamps[r.radius];
-    for (int k = 0; k < st.len; k++) {
-        if (cx + st.pts[k][0] == px && cy + st.pts[k][1] == py) return true;
+// ── Spark launcher ────────────────────────────────────────────────────────────
+static void _pcbaLaunchSpark(uint8_t routeIdx) {
+    for (int i = 0; i < PCBA_MAX_SPARKS; i++) {
+        if (_pcbaSparks[i].active) continue;
+        _pcbaSparks[i].active     = true;
+        _pcbaSparks[i].routeIdx   = routeIdx;
+        _pcbaSparks[i].pos        = 0.0f;
+        _pcbaSparks[i].speed      = PCBA_SPARK_SPEED
+                                    * (0.85f + (float)random8(30) / 100.0f);
+        _pcbaSparks[i].speedBoost = 1.0f;
+        return;
     }
-    return false;
-}
-
-// Check if any asteroid occupies pixel (px, py) — used by ship AI
-static bool _astAnyRockAt(int px, int py) {
-    for (int i = 0; i < AST_NUM_ROCKS; i++)
-        if (_astRockCoversPixel(i, px, py)) return true;
-    return false;
-}
-
-// Ship AI: scan heading for asteroid pixels, return safest heading
-static uint8_t _astPickHeading(float sx, float sy, uint8_t curHeading) {
-    // Try directions in order of preference: current, ±1, ±2, ±3, opposite
-    // Return first heading that is clear for AST_SHIP_LOOKAHEAD steps
-    const uint8_t tryOrder[8] = {0, 1, 7, 2, 6, 3, 5, 4}; // relative offsets
-
-    for (int t = 0; t < 8; t++) {
-        uint8_t h = (curHeading + tryOrder[t]) & 7;
-        bool clear = true;
-        float tx = sx, ty = sy;
-        for (int step = 1; step <= AST_SHIP_LOOKAHEAD; step++) {
-            tx += _astDX[h] * _astDS[h] * AST_SHIP_SPEED;
-            ty += _astDY[h] * _astDS[h] * AST_SHIP_SPEED;
-            // Wrap test position
-            float wtx = tx, wty = ty;
-            _astWrap(wtx, -AST_WRAP_MARGIN, MATRIX_COLS + AST_WRAP_MARGIN);
-            _astWrap(wty, -AST_WRAP_MARGIN, MATRIX_ROWS + AST_WRAP_MARGIN);
-            int ipx = (int)roundf(wtx);
-            int ipy = (int)roundf(wty);
-            // Check the 3 ship pixels that would be at this position
-            for (int p = 0; p < 3; p++) {
-                int spx = ipx + _astShipPx[h][p][0];
-                int spy = ipy + _astShipPx[h][p][1];
-                if (_astAnyRockAt(spx, spy)) { clear = false; break; }
-            }
-            if (!clear) break;
-        }
-        if (clear) return h;
-    }
-    // All directions blocked — maintain current (rare, just hold course)
-    return curHeading;
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-static void _astInit() {
-    for (int i = 0; i < AST_NUM_ROCKS; i++) _astSpawnRock(i, false);
-    // Ship starts near centre
-    _astShip.cx         = (float)(MATRIX_COLS / 2);
-    _astShip.cy         = (float)(MATRIX_ROWS / 2);
-    _astShip.heading    = 0;
-    _astShip.thinkTimer = AST_SHIP_THINK_FRAMES;
+static void _pcbaInit() {
+    _pcbaShape   = 0;
+    _pcbaBoardAt = millis();
+    _pcbaRouteAt = millis();
+    _pcbaFrameNo = 0;
+    memset(_pcbaSparks, 0, sizeof(_pcbaSparks));
+    _pcbaGenRoutes(_pcbaShape);
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
-static void renderAsteroids() {
+static void renderPcba() {
+    uint32_t now = millis();
+    _pcbaFrameNo++;
+
+    // ── Board shape cycle ─────────────────────────────────────────────────────
+    if (now - _pcbaBoardAt >= PCBA_BOARD_CYCLE_MS) {
+        _pcbaBoardAt = now;
+        _pcbaShape   = (_pcbaShape + 1) % 6;
+        memset(_pcbaSparks, 0, sizeof(_pcbaSparks));
+        _pcbaGenRoutes(_pcbaShape);
+        _pcbaRouteAt = now;
+    }
+
+    // ── Route re-randomisation ────────────────────────────────────────────────
+    if (now - _pcbaRouteAt >= PCBA_ROUTE_CYCLE_MS) {
+        _pcbaRouteAt = now;
+        memset(_pcbaSparks, 0, sizeof(_pcbaSparks));
+        _pcbaGenRoutes(_pcbaShape);
+    }
 
     // ── Beat ──────────────────────────────────────────────────────────────────
     if (beatFired) {
-        for (int i = 0; i < AST_NUM_ROCKS; i++) {
-            _astRocks[i].brightBoost = (float)AST_BEAT_BRIGHT_BOOST;
-            _astRocks[i].speedBoost  = AST_BEAT_SPEED_SURGE;
+        for (int i = 0; i < PCBA_MAX_SPARKS; i++)
+            if (_pcbaSparks[i].active)
+                _pcbaSparks[i].speedBoost = PCBA_BEAT_SURGE;
+    }
+
+    // ── Burst scheduler — per route ───────────────────────────────────────────
+    for (int r = 0; r < _pcbaNumRoutes; r++) {
+        PcbaRoute& rt = _pcbaRoutes[r];
+
+        if (rt.burstRemain > 0) {
+            // Mid-burst: spacing timer
+            if (rt.burstSpacingTimer == 0) {
+                _pcbaLaunchSpark(r);
+                rt.burstRemain--;
+                rt.burstSpacingTimer = rt.burstSpacing;
+            } else {
+                rt.burstSpacingTimer--;
+            }
+        } else {
+            // Between bursts
+            if (rt.burstTimer == 0) {
+                rt.burstRemain       = _pcbaRand8(1, 3);
+                rt.burstSpacing      = _pcbaRand8(4, 8);
+                rt.burstSpacingTimer = 0;
+                rt.burstTimer        = _pcbaRand8(PCBA_BURST_GAP_MIN,
+                                                   PCBA_BURST_GAP_MAX);
+            } else {
+                rt.burstTimer--;
+            }
         }
     }
 
-    // ── Update rocks ──────────────────────────────────────────────────────────
-    for (int i = 0; i < AST_NUM_ROCKS; i++) {
-        AstRock& r = _astRocks[i];
+    // ── Update sparks ─────────────────────────────────────────────────────────
+    for (int i = 0; i < PCBA_MAX_SPARKS; i++) {
+        PcbaSpark& s = _pcbaSparks[i];
+        if (!s.active) continue;
 
-        // Decay beat effects
-        if (r.brightBoost > 0.5f) r.brightBoost *= AST_BEAT_BRIGHT_DECAY;
-        else r.brightBoost = 0.0f;
-        if (r.speedBoost > 1.01f) r.speedBoost *= AST_BEAT_SPEED_DECAY;
-        else r.speedBoost = 1.0f;
+        // Decay speed boost
+        if (s.speedBoost > 1.01f) s.speedBoost *= PCBA_BEAT_DECAY;
+        else s.speedBoost = 1.0f;
 
-        // Move
-        float spd = r.speed * r.speedBoost;
-        r.cx += _astDX[r.dirIdx] * _astDS[r.dirIdx] * spd;
-        r.cy += _astDY[r.dirIdx] * _astDS[r.dirIdx] * spd;
+        s.pos += s.speed * s.speedBoost;
 
-        // Wrap
-        float lo = -AST_WRAP_MARGIN, hiX = MATRIX_COLS + AST_WRAP_MARGIN;
-        float hiY = MATRIX_ROWS + AST_WRAP_MARGIN;
-        _astWrap(r.cx, lo, hiX);
-        _astWrap(r.cy, lo, hiY);
+        // Retire when past end of route
+        PcbaRoute& rt = _pcbaRoutes[s.routeIdx];
+        if (s.pos >= (float)(rt.len - 1)) s.active = false;
     }
 
-    // ── Ship AI ───────────────────────────────────────────────────────────────
-    _astShip.thinkTimer--;
-    if (_astShip.thinkTimer <= 0) {
-        _astShip.heading    = _astPickHeading(_astShip.cx, _astShip.cy,
-                                               _astShip.heading);
-        _astShip.thinkTimer = AST_SHIP_THINK_FRAMES;
-    }
-
-    // Move ship
-    _astShip.cx += _astDX[_astShip.heading] * _astDS[_astShip.heading] * AST_SHIP_SPEED;
-    _astShip.cy += _astDY[_astShip.heading] * _astDS[_astShip.heading] * AST_SHIP_SPEED;
-    _astWrap(_astShip.cx, -AST_WRAP_MARGIN, MATRIX_COLS + AST_WRAP_MARGIN);
-    _astWrap(_astShip.cy, -AST_WRAP_MARGIN, MATRIX_ROWS + AST_WRAP_MARGIN);
-
-    // ── Draw ──────────────────────────────────────────────────────────────────
+    // ── Draw board background ─────────────────────────────────────────────────
     matrix.setBrightness(BRIGHTNESS);
     matrix.fillScreen(0);
 
-    // Draw asteroids (back-to-front, they overlap freely)
-    for (int i = 0; i < AST_NUM_ROCKS; i++) {
-        AstRock& r   = _astRocks[i];
-        int cx       = (int)roundf(r.cx);
-        int cy       = (int)roundf(r.cy);
-        uint8_t bri  = (uint8_t)fminf(255.0f, (float)r.brightness + r.brightBoost);
-        // Slight blue tint for larger rocks (matching starfield colour feel)
-        // Small rocks are pure grey; large rocks have a faint cold cast
-        uint8_t rv = (uint8_t)(bri * (1.0f - r.radius * 0.025f));
-        uint8_t gv = (uint8_t)(bri * (1.0f - r.radius * 0.015f));
-        uint8_t bv = bri;
-        uint16_t col16 = matrix.Color(rv, gv, bv);
+    for (int y = 0; y < MATRIX_ROWS; y++) {
+        for (int x = 0; x < MATRIX_COLS; x++) {
+            if (!_pcbaInBoard(x, y, _pcbaShape)) continue;
 
-        const AstStamp& st = _astStamps[r.radius];
-        for (int k = 0; k < st.len; k++) {
-            int px = cx + st.pts[k][0];
-            int py = cy + st.pts[k][1];
-            if (px >= 0 && px < MATRIX_COLS && py >= 0 && py < MATRIX_ROWS)
-                matrix.drawPixel(px, DRAW_Y(py), col16);
+            // Detect edge pixel: any 4-neighbour outside the board
+            bool edge = !_pcbaInBoard(x+1,y,_pcbaShape) ||
+                        !_pcbaInBoard(x-1,y,_pcbaShape) ||
+                        !_pcbaInBoard(x,y+1,_pcbaShape) ||
+                        !_pcbaInBoard(x,y-1,_pcbaShape);
+
+            uint8_t r, g, b;
+            if (edge) {
+                r = PCBA_COL_EDGE_R; g = PCBA_COL_EDGE_G; b = PCBA_COL_EDGE_B;
+            } else {
+                // Subtle grid: brighten pixels where x or y is even
+                bool grid = ((x & 1) == 0) || ((y & 1) == 0);
+                r = grid ? PCBA_COL_MID_R  : PCBA_COL_DARK_R;
+                g = grid ? PCBA_COL_MID_G  : PCBA_COL_DARK_G;
+                b = grid ? PCBA_COL_MID_B  : PCBA_COL_DARK_B;
+            }
+            matrix.drawPixel(x, DRAW_Y(y), matrix.Color(r, g, b));
         }
     }
 
-    // Draw ship on top (always visible)
-    int sx = (int)roundf(_astShip.cx);
-    int sy = (int)roundf(_astShip.cy);
-    uint8_t h = _astShip.heading;
-    for (int p = 0; p < 3; p++) {
-        int px = sx + _astShipPx[h][p][0];
-        int py = sy + _astShipPx[h][p][1];
-        if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS) continue;
-        // Nose = pure white, rear pixels = dim white
-        uint8_t bri = (p == 0) ? 255 : 160;
-        matrix.drawPixel(px, DRAW_Y(py), matrix.Color(bri, bri, bri));
+    // ── Draw route highlights (dim trace lines) ───────────────────────────────
+    // Render a very subtle brightening along each route so the paths are
+    // barely visible as PCB traces even when no spark is on them.
+    for (int r = 0; r < _pcbaNumRoutes; r++) {
+        PcbaRoute& rt = _pcbaRoutes[r];
+        for (int k = 0; k < rt.len; k++) {
+            int x = rt.px[k], y = rt.py[k];
+            if (x < 0 || x >= MATRIX_COLS || y < 0 || y >= MATRIX_ROWS) continue;
+            // Brighten trace pixel slightly above substrate
+            matrix.drawPixel(x, DRAW_Y(y), matrix.Color(0, 105, 32));
+        }
+    }
+
+    // ── Draw sparks (tail first, head last) ───────────────────────────────────
+    // Pre-build a frame buffer so multiple sparks on the same pixel
+    // take the brightest value (additive-ish).
+    static uint8_t _pcbaFbR[8][8], _pcbaFbG[8][8], _pcbaFbB[8][8];
+    memset(_pcbaFbR, 0, sizeof(_pcbaFbR));
+    memset(_pcbaFbG, 0, sizeof(_pcbaFbG));
+    memset(_pcbaFbB, 0, sizeof(_pcbaFbB));
+
+    for (int i = 0; i < PCBA_MAX_SPARKS; i++) {
+        PcbaSpark& s = _pcbaSparks[i];
+        if (!s.active) continue;
+        PcbaRoute& rt = _pcbaRoutes[s.routeIdx];
+
+        // Draw head + tail
+        for (int t = 0; t <= PCBA_TAIL_LEN; t++) {
+            float tp = s.pos - (float)t;
+            if (tp < 0.0f) break;
+
+            // Interpolate between route waypoints
+            int   wi  = (int)tp;
+            float frac = tp - (float)wi;
+            if (wi >= rt.len - 1) { wi = rt.len - 2; frac = 1.0f; }
+            wi = (wi < 0) ? 0 : wi;
+
+            float fx = (float)rt.px[wi] + frac * (float)(rt.px[wi+1] - rt.px[wi]);
+            float fy = (float)rt.py[wi] + frac * (float)(rt.py[wi+1] - rt.py[wi]);
+            int   px = (int)roundf(fx);
+            int   py = (int)roundf(fy);
+            if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS) continue;
+
+            // Brightness: head=255, tail decays exponentially
+            float decay = (t == 0) ? 1.0f
+                        : 1.0f / (1.0f + (float)t * (float)t * 0.38f);
+
+            // Colour: head=bright gold, tail fades to amber→dark brown
+            float headBlend = decay; // 1.0 at head, 0 at tip
+            uint8_t pr = (uint8_t)(headBlend * PCBA_HEAD_R + (1.0f-headBlend) * PCBA_TAIL_R);
+            uint8_t pg = (uint8_t)(headBlend * PCBA_HEAD_G + (1.0f-headBlend) * PCBA_TAIL_G);
+            uint8_t pb = (uint8_t)(headBlend * PCBA_HEAD_B + (1.0f-headBlend) * PCBA_TAIL_B);
+            pr = (uint8_t)((float)pr * decay);
+            pg = (uint8_t)((float)pg * decay);
+            pb = (uint8_t)((float)pb * decay);
+
+            // Accumulate — take max per channel so sparks don't cancel
+            if (pr > _pcbaFbR[px][py]) _pcbaFbR[px][py] = pr;
+            if (pg > _pcbaFbG[px][py]) _pcbaFbG[px][py] = pg;
+            if (pb > _pcbaFbB[px][py]) _pcbaFbB[px][py] = pb;
+        }
+    }
+
+    // Composite spark buffer onto matrix (skip zero pixels — board shows through)
+    for (int y = 0; y < MATRIX_ROWS; y++)
+        for (int x = 0; x < MATRIX_COLS; x++)
+            if (_pcbaFbR[x][y] || _pcbaFbG[x][y] || _pcbaFbB[x][y])
+                matrix.drawPixel(x, DRAW_Y(y),
+                    matrix.Color(_pcbaFbR[x][y], _pcbaFbG[x][y], _pcbaFbB[x][y]));
+}
+
+// =============================================================================
+// MODE_WISP — Will-o'-the-wisp
+//
+// A pale blue-green blob drifts slowly around the matrix on a Lissajous path,
+// breathing in and out with a slow radius pulse.  Its edge is ragged and
+// organic — per-pixel Perlin noise perturbs the falloff radius at each angle,
+// giving a soft, irregular silhouette that shifts every frame.  A pool of
+// sparkles orbit just outside the bright core at varying radii and angular
+// speeds; each sparkle has its own brightness envelope so they twinkle and
+// fade independently.
+//
+// Colour model
+//   Core centre : R=160  G=255  B=255  (cold blue-white)
+//   Core fringe : R=0    G=180  B=200  (deep teal)
+//   Sparkles    : white-hot → pale blue-green; rare yellow-green flash
+//
+// Beat response
+//   The blob flares (radius spike) and all sparkles surge outward.
+// =============================================================================
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+#define WISP_CORE_RADIUS    2.4f   // base blob radius (pixels)
+#define WISP_BREATH_DEPTH   0.8f   // ± how much radius breathes
+#define WISP_BREATH_PERIOD  280    // frames per full breath cycle
+#define WISP_EDGE_DEPTH     1.4f   // ± noise perturbation on edge (pixels)
+#define WISP_EDGE_ZSPEED    3      // z-axis Perlin drift speed (0-255/frame)
+#define WISP_DRIFT_RADIUS   2.2f   // max drift from matrix centre (pixels)
+#define WISP_DRIFT_PER_A    0.0071f// drift oscillator A frequency (rad/frame)
+#define WISP_DRIFT_PER_B    0.0113f// drift oscillator B frequency (irrational ratio)
+
+#define WISP_NUM_SPARKS     10     // sparkle pool size
+#define WISP_SPARK_ORBT_MIN 2.6f   // min orbit radius
+#define WISP_SPARK_ORBT_MAX 4.2f   // max orbit radius
+#define WISP_SPARK_LIFE_MIN 40     // min sparkle lifetime (frames)
+#define WISP_SPARK_LIFE_MAX 110    // max sparkle lifetime (frames)
+#define WISP_SPARK_SPD_MIN  0.022f // min angular speed (rad/frame)
+#define WISP_SPARK_SPD_MAX  0.085f // max angular speed (rad/frame)
+
+#define WISP_BEAT_FLARE     1.2f   // blob radius boost on beat
+#define WISP_BEAT_DECAY     0.88f  // flare decay per frame
+#define WISP_BEAT_SURGE     1.5f   // sparkle orbit surge multiplier on beat
+#define WISP_BEAT_SDECAY    0.91f  // surge decay per frame
+
+// ── Sparkle struct ────────────────────────────────────────────────────────────
+struct WispSpark {
+    float   angle;        // current orbital angle (radians)
+    float   orbitR;       // orbit radius (pixels from blob centre)
+    float   angSpd;       // angular speed (rad/frame); sign = CW or CCW
+    float   phase;        // brightness phase (0–2π)
+    float   phaseSpd;     // how fast phase advances (rad/frame)
+    uint8_t life;         // frames remaining
+    uint8_t maxLife;      // total lifetime (for fade envelope)
+    bool    yellowGreen;  // rare warm-tint variant
+    float   surgeBoost;   // extra outward push from beat (decays to 0)
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static WispSpark _wispSparks[WISP_NUM_SPARKS];
+static float     _wispDriftT  = 0.0f;  // drift oscillator time
+static uint16_t  _wispBreathT = 0;     // breath counter
+static uint16_t  _wispNoiseZ  = 0;     // Perlin z-slice for edge noise
+static float     _wispFlare   = 0.0f;  // beat flare (decays to 0)
+
+// Blob centre in pixel coordinates (derived each frame from drift)
+static float     _wispCX = 0.0f, _wispCY = 0.0f;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+static inline float _wispRandF(float lo, float hi) {
+    return lo + ((float)random8() / 255.0f) * (hi - lo);
+}
+
+static void _wispSpawnSpark(WispSpark& s, bool randomPhase) {
+    s.angle     = _wispRandF(0.0f, 6.2832f);
+    s.orbitR    = _wispRandF(WISP_SPARK_ORBT_MIN, WISP_SPARK_ORBT_MAX);
+    // 50% clockwise, 50% counter
+    float spd   = _wispRandF(WISP_SPARK_SPD_MIN, WISP_SPARK_SPD_MAX);
+    s.angSpd    = (random8(2) == 0) ? spd : -spd;
+    s.phase     = randomPhase ? _wispRandF(0.0f, 6.2832f) : 0.0f;
+    s.phaseSpd  = _wispRandF(0.04f, 0.13f);
+    s.maxLife   = WISP_SPARK_LIFE_MIN
+                  + random8(WISP_SPARK_LIFE_MAX - WISP_SPARK_LIFE_MIN);
+    s.life      = s.maxLife;
+    s.yellowGreen = (random8(100) < 12); // 12% chance of warm variant
+    s.surgeBoost  = 0.0f;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+static void _wispInit() {
+    _wispDriftT  = 0.0f;
+    _wispBreathT = 0;
+    _wispNoiseZ  = random16();
+    _wispFlare   = 0.0f;
+    float cx = (float)MATRIX_COLS * 0.5f - 0.5f;
+    float cy = (float)MATRIX_ROWS * 0.5f - 0.5f;
+    _wispCX = cx;  _wispCY = cy;
+    for (int i = 0; i < WISP_NUM_SPARKS; i++) {
+        _wispSpawnSpark(_wispSparks[i], true);
+        // Stagger lifetimes so they don't all die at once at startup
+        _wispSparks[i].life = 1 + random8(_wispSparks[i].maxLife);
     }
 }
 
+// ── Render ────────────────────────────────────────────────────────────────────
+static void renderWisp() {
 
-#endif // end of mode implementations
+    // ── Beat ──────────────────────────────────────────────────────────────────
+    if (beatFired) {
+        _wispFlare = WISP_BEAT_FLARE;
+        for (int i = 0; i < WISP_NUM_SPARKS; i++)
+            _wispSparks[i].surgeBoost = WISP_BEAT_SURGE;
+    }
+    if (_wispFlare > 0.01f) _wispFlare *= WISP_BEAT_DECAY; else _wispFlare = 0.0f;
+
+    // ── Drift — Lissajous: two sine oscillators at irrational ratio ───────────
+    float matCX = (float)MATRIX_COLS * 0.5f - 0.5f;
+    float matCY = (float)MATRIX_ROWS * 0.5f - 0.5f;
+    _wispCX = matCX + sinf(_wispDriftT * WISP_DRIFT_PER_A) * WISP_DRIFT_RADIUS;
+    _wispCY = matCY + sinf(_wispDriftT * WISP_DRIFT_PER_B) * WISP_DRIFT_RADIUS;
+    _wispDriftT += 1.0f;
+
+    // ── Breathe ───────────────────────────────────────────────────────────────
+    _wispBreathT = (_wispBreathT + 1) % WISP_BREATH_PERIOD;
+    float breathPhase = (float)_wispBreathT / (float)WISP_BREATH_PERIOD;
+    float breathScale = 1.0f + WISP_BREATH_DEPTH
+                        * sinf(breathPhase * 6.2832f); // 0..2π over one period
+    float baseR = WISP_CORE_RADIUS * breathScale + _wispFlare;
+
+    // Advance Perlin z for edge wobble
+    _wispNoiseZ += WISP_EDGE_ZSPEED;
+
+    // ── Draw background + blob ────────────────────────────────────────────────
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+
+    for (int py = 0; py < MATRIX_ROWS; py++) {
+        for (int px = 0; px < MATRIX_COLS; px++) {
+            float dx = (float)px - _wispCX;
+            float dy = (float)py - _wispCY;
+            float dist = sqrtf(dx*dx + dy*dy);
+
+            // Sample Perlin noise along the angle to perturb the edge radius.
+            // Use angle quantised to 0-255 as x, z-slice for time.
+            // atan2f → -π..π, remap to 0..255 for inoise8.
+            uint8_t angIdx = (uint8_t)(((atan2f(dy, dx) + 3.14159f)
+                                        / 6.28318f) * 255.0f);
+            uint8_t edgeNoise = inoise8(angIdx, (uint8_t)(_wispNoiseZ >> 2));
+            // Map 0-255 noise to ± WISP_EDGE_DEPTH
+            float edgePerturb = ((float)(int8_t)(edgeNoise - 128))
+                                / 128.0f * WISP_EDGE_DEPTH;
+            float effectiveR  = baseR + edgePerturb;
+            effectiveR = fmaxf(effectiveR, 0.4f); // never collapse to nothing
+
+            if (dist > effectiveR + 1.5f) continue; // fully outside — skip
+
+            // Brightness: 1.0 at centre, falls as gaussian-ish curve
+            float t;
+            if (dist <= effectiveR) {
+                // Inside edge: full→dim with smooth falloff
+                t = 1.0f - (dist / effectiveR) * 0.55f;
+            } else {
+                // Outside edge: fringe fade-out over 1.5px
+                t = 0.45f * (1.0f - (dist - effectiveR) / 1.5f);
+                t = fmaxf(t, 0.0f);
+            }
+
+            // Colour: lerp from cold-white core (t≈1) to deep teal fringe (t≈0)
+            // Core: R=160 G=255 B=255   Fringe: R=0 G=140 B=180
+            uint8_t rv = (uint8_t)(t * t * 160.0f);          // core only
+            uint8_t gv = (uint8_t)((t * 115.0f + 140.0f) * t);
+            uint8_t bv = (uint8_t)((t *  75.0f + 180.0f) * t);
+
+            // Clamp
+            if (rv > 255) rv = 255;
+            if (gv > 255) gv = 255;
+            if (bv > 255) bv = 255;
+
+            matrix.drawPixel(px, DRAW_Y(py), matrix.Color(rv, gv, bv));
+        }
+    }
+
+    // ── Update and draw sparkles ───────────────────────────────────────────────
+    for (int i = 0; i < WISP_NUM_SPARKS; i++) {
+        WispSpark& s = _wispSparks[i];
+
+        // Decay beat surge
+        if (s.surgeBoost > 0.01f) s.surgeBoost *= WISP_BEAT_SDECAY;
+        else s.surgeBoost = 0.0f;
+
+        // Age — respawn when expired
+        if (s.life == 0) { _wispSpawnSpark(s, false); }
+        s.life--;
+
+        // Orbit
+        s.angle += s.angSpd;
+        s.phase += s.phaseSpd;
+
+        float r = s.orbitR + s.surgeBoost;
+        float sx = _wispCX + cosf(s.angle) * r;
+        float sy = _wispCY + sinf(s.angle) * r;
+        int   px = (int)roundf(sx);
+        int   py = (int)roundf(sy);
+        if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS) continue;
+
+        // Brightness envelope: ramp up, sustain, ramp down + twinkle modulation
+        float lifeT = (float)s.life / (float)s.maxLife; // 1→0 as spark ages
+        float rampUp   = fminf(1.0f, (float)(s.maxLife - s.life) / 12.0f);
+        float rampDown  = fminf(1.0f, lifeT * (float)s.maxLife / 12.0f);
+        float envelope  = fminf(rampUp, rampDown);
+        float twinkle   = 0.55f + 0.45f * sinf(s.phase); // 0.1 .. 1.0
+        float bri       = envelope * twinkle;
+
+        uint8_t sb;
+        uint8_t sr, sg;
+        if (s.yellowGreen) {
+            // Rare warm flash: yellow-green "foolish fire"
+            sb = (uint8_t)(bri * 80.0f);
+            sg = (uint8_t)(bri * 255.0f);
+            sr = (uint8_t)(bri * 200.0f);
+        } else {
+            // Normal sparkle: white-hot → pale blue-green
+            sr = (uint8_t)(bri * 180.0f);
+            sg = (uint8_t)(bri * 255.0f);
+            sb = (uint8_t)(bri * 255.0f);
+        }
+        matrix.drawPixel(px, DRAW_Y(py), matrix.Color(sr, sg, sb));
+    }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Init + Update — always compiled
@@ -2236,92 +2544,100 @@ void visualizerInit() {
     matrix.show();
     initPalettes(); // populate HeatColors_p, RainbowColors_p etc.
 
-    // Mode-specific one-time setup
-#if ACTIVE_MODE == MODE_PULSE
-    _pulsePal = RainbowColors_p;
-    memset(_pulseLeds, 0, sizeof(_pulseLeds));
-#elif ACTIVE_MODE == MODE_WAVE
-    _wavePal = RainbowColors_p;
-    memset(_waveLeds, 0, sizeof(_waveLeds));
-#elif ACTIVE_MODE == MODE_CONFETTI
-    _confPal = RainbowColors_p;
-    memset(_confLeds, 0, sizeof(_confLeds));
-#elif ACTIVE_MODE == MODE_TORCH || ACTIVE_MODE == MODE_TORCH2
-    memset(_tCur,  0, sizeof(_tCur));
-    memset(_tNxt,  0, sizeof(_tNxt));
-    memset(_tMode, 0, sizeof(_tMode));
-#elif ACTIVE_MODE == MODE_CLOUD_TWINKLES || ACTIVE_MODE == MODE_RAINBOW_TWINKLES
+    // Initialise all mode state — all modes are now always compiled
+    _pulsePal = RainbowColors_p; memset(_pulseLeds,    0, sizeof(_pulseLeds));
+    _wavePal  = RainbowColors_p; memset(_waveLeds,     0, sizeof(_waveLeds));
+    _confPal  = RainbowColors_p; memset(_confLeds,     0, sizeof(_confLeds));
+    memset(_tCur,      0, sizeof(_tCur));
+    memset(_tNxt,      0, sizeof(_tNxt));
+    memset(_tMode,     0, sizeof(_tMode));
     memset(_twLeds,    0, sizeof(_twLeds));
-    memset(_twDirFlags, 0, sizeof(_twDirFlags));
-#elif ACTIVE_MODE == MODE_RAIN
-    memset(_rainStreaks, 0, sizeof(_rainStreaks));
+    memset(_twDirFlags,0, sizeof(_twDirFlags));
+    memset(_rainStreaks,0, sizeof(_rainStreaks));
     memset(_rainGhost,  0, sizeof(_rainGhost));
     memset(_rainSnap,   0, sizeof(_rainSnap));
     _rainFlashFrames = 0;
-#elif ACTIVE_MODE == MODE_STARFIELD
     for (int i = 0; i < STAR_COUNT; i++) _sfSpawnStar(_sfStars[i]);
     _sfAccelBoost = 0.0f;
-#elif ACTIVE_MODE == MODE_DUNE
     _duneInit();
-#elif ACTIVE_MODE == MODE_GEOMETRIC
     _geoInit();
-#elif ACTIVE_MODE == MODE_ASTEROIDS
-    _astInit();
-#endif
+    _wispInit();
+    _pcbaInit();
+}
+
+// ── Runtime mode state (variable declared near top of file) ─────────────────
+
+void visualizerSetMode(uint8_t mode) {
+    if (mode == _runtimeMode) return;
+    _runtimeMode = mode;
+    if (mode == MODE_PULSE)   { _pulsePal = RainbowColors_p; memset(_pulseLeds,   0, sizeof(_pulseLeds)); }
+    if (mode == MODE_WAVE)    { _wavePal  = RainbowColors_p; memset(_waveLeds,    0, sizeof(_waveLeds)); }
+    if (mode == MODE_CONFETTI){ _confPal  = RainbowColors_p; memset(_confLeds,    0, sizeof(_confLeds)); }
+    if (mode == MODE_TORCH || mode == MODE_TORCH2) {
+        memset(_tCur, 0, sizeof(_tCur));
+        memset(_tNxt, 0, sizeof(_tNxt));
+        memset(_tMode,0, sizeof(_tMode));
+    }
+    if (mode == MODE_CLOUD_TWINKLES || mode == MODE_RAINBOW_TWINKLES) {
+        memset(_twLeds,    0, sizeof(_twLeds));
+        memset(_twDirFlags,0, sizeof(_twDirFlags));
+    }
+    if (mode == MODE_RAIN) {
+        memset(_rainStreaks, 0, sizeof(_rainStreaks));
+        memset(_rainGhost,  0, sizeof(_rainGhost));
+        memset(_rainSnap,   0, sizeof(_rainSnap));
+        _rainFlashFrames = 0;
+    }
+    if (mode == MODE_STARFIELD) {
+        for (int i = 0; i < STAR_COUNT; i++) _sfSpawnStar(_sfStars[i]);
+        _sfAccelBoost = 0.0f;
+    }
+    if (mode == MODE_DUNE)      _duneInit();
+    if (mode == MODE_GEOMETRIC) _geoInit();
+    if (mode == MODE_WISP)      _wispInit();
+    if (mode == MODE_PCBA)      _pcbaInit();
+    matrix.fillScreen(0);
+    matrix.show();
 }
 
 void visualizerUpdate() {
     // Beat detection runs for every mode
     beatDetect();
 
-    // Dispatch to exactly one render function
-#if   ACTIVE_MODE == MODE_SPECTRUM
-    renderSpectrum();
-#elif ACTIVE_MODE == MODE_FIRE
-    renderFire();
-#elif ACTIVE_MODE == MODE_TORCH || ACTIVE_MODE == MODE_TORCH2
-    renderTorch();
-#elif ACTIVE_MODE == MODE_PULSE
-    renderPulse();
-#elif ACTIVE_MODE == MODE_WAVE
-    renderWave();
-#elif ACTIVE_MODE == MODE_RAINBOW_NOISE      || \
-      ACTIVE_MODE == MODE_RAINBOW_STRIPE_NOISE || \
-      ACTIVE_MODE == MODE_PARTY_NOISE        || \
-      ACTIVE_MODE == MODE_FOREST_NOISE       || \
-      ACTIVE_MODE == MODE_CLOUD_NOISE        || \
-      ACTIVE_MODE == MODE_FIRE_NOISE         || \
-      ACTIVE_MODE == MODE_LAVA_NOISE         || \
-      ACTIVE_MODE == MODE_OCEAN_NOISE
-    renderNoise();
-#elif ACTIVE_MODE == MODE_CONFETTI
-    renderConfetti();
-#elif ACTIVE_MODE == MODE_JUGGLE
-    renderJuggle();
-#elif ACTIVE_MODE == MODE_SINELON
-    renderSinelon();
-#elif ACTIVE_MODE == MODE_PRIDE
-    renderPride();
-#elif ACTIVE_MODE == MODE_COLOR_WAVES
-    renderColorWaves();
-#elif ACTIVE_MODE == MODE_RAINBOW      || \
-      ACTIVE_MODE == MODE_RAINBOW_GLITTER || \
-      ACTIVE_MODE == MODE_HUE_CYCLE
-    renderSimple();
-#elif ACTIVE_MODE == MODE_CLOUD_TWINKLES || \
-      ACTIVE_MODE == MODE_RAINBOW_TWINKLES
-    renderTwinkles();
-#elif ACTIVE_MODE == MODE_RAIN
-    renderRain();
-#elif ACTIVE_MODE == MODE_STARFIELD
-    renderStarfield();
-#elif ACTIVE_MODE == MODE_DUNE
-    renderDune();
-#elif ACTIVE_MODE == MODE_GEOMETRIC
-    renderGeometric();
-#elif ACTIVE_MODE == MODE_ASTEROIDS
-    renderAsteroids();
-#endif
+    // Runtime dispatch — all render functions always compiled
+    switch (_runtimeMode) {
+        case MODE_SPECTRUM:             renderSpectrum();   break;
+        case MODE_FIRE:                 renderFire();       break;
+        case MODE_TORCH:
+        case MODE_TORCH2:               renderTorch();      break;
+        case MODE_PULSE:                renderPulse();      break;
+        case MODE_WAVE:                 renderWave();       break;
+        case MODE_RAINBOW_NOISE:
+        case MODE_RAINBOW_STRIPE_NOISE:
+        case MODE_PARTY_NOISE:
+        case MODE_FOREST_NOISE:
+        case MODE_CLOUD_NOISE:
+        case MODE_FIRE_NOISE:
+        case MODE_LAVA_NOISE:
+        case MODE_OCEAN_NOISE:          renderNoise();      break;
+        case MODE_CONFETTI:             renderConfetti();   break;
+        case MODE_JUGGLE:               renderJuggle();     break;
+        case MODE_SINELON:              renderSinelon();    break;
+        case MODE_PRIDE:                renderPride();      break;
+        case MODE_COLOR_WAVES:          renderColorWaves(); break;
+        case MODE_RAINBOW:
+        case MODE_RAINBOW_GLITTER:
+        case MODE_HUE_CYCLE:            renderSimple();     break;
+        case MODE_CLOUD_TWINKLES:
+        case MODE_RAINBOW_TWINKLES:     renderTwinkles();   break;
+        case MODE_RAIN:                 renderRain();       break;
+        case MODE_STARFIELD:            renderStarfield();  break;
+        case MODE_DUNE:                 renderDune();       break;
+        case MODE_GEOMETRIC:            renderGeometric();  break;
+        case MODE_WISP:                 renderWisp();       break;
+        case MODE_PCBA:                 renderPcba();       break;
+        default:                        renderSpectrum();   break;
+    }
 
     matrix.show();
 }

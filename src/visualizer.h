@@ -38,7 +38,8 @@
  *   MODE_STARFIELD         Classic warp-speed starfield, accelerating outward from center
  *   MODE_DUNE               Desert dune ridges, sand palette, slow S-curve morphing, dust twinkles
  *   MODE_GEOMETRIC           Overlapping rectangles, colour palette cycles, jiggle and migrate
- *   MODE_ASTEROIDS          Asteroids-style drifting rocks with an evasive 3-pixel ship
+ *   MODE_WISP               Will-o'-the-wisp: drifting pale blue-green blob with orbiting sparkles
+   MODE_PCBA               PCB artwork: green board outlines with golden spark traces
  *
  * ══════════════════════════════════════════════════════════════════════════════
  * BEAT DETECTION
@@ -56,8 +57,10 @@
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_NeoMatrix.h>
 
-// ── Active mode — change this one line ───────────────────────────────────────
-#define ACTIVE_MODE  MODE_ASTEROIDS
+// ── Compile-time default mode ───────────────────────────────────────────────
+// Used when BUTTONS_ENABLED 0 — device boots straight into this effect.
+// When BUTTONS_ENABLED 1 the MODE button overrides this at runtime.
+#define ACTIVE_MODE  MODE_SPECTRUM
 
 // ── Mode identifiers ─────────────────────────────────────────────────────────
 #define MODE_SPECTRUM              0
@@ -101,8 +104,10 @@
 // ── Public API ────────────────────────────────────────────────────────────────
 void visualizerInit();
 void visualizerUpdate();
+void visualizerSetMode(uint8_t mode);  // runtime mode switch (called by buttons.cpp)
 #define MODE_RAIN                 24
 #define MODE_STARFIELD            25
 #define MODE_DUNE                 26
 #define MODE_GEOMETRIC            27
-#define MODE_ASTEROIDS            28
+#define MODE_WISP                 29
+#define MODE_PCBA                 30
