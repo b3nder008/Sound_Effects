@@ -1607,6 +1607,622 @@ static void renderDune() {
     }
 }
 
+// =============================================================================
+// MODE_GEOMETRIC -- Axis-aligned hollow rectangles, palette cycling
+//
+// Architecture
+// ------------
+//   GEO_NUM_SHAPES axis-aligned hollow rectangles (no rotation).
+//   Each is defined by its centre (cx,cy) and half-extents (hw,hh).
+//   Dimensions are always integers when rendered -- float values drive
+//   smooth sub-pixel interpolated motion that snaps to integer pixels
+//   each frame, giving crisp edges with smooth movement.
+//
+//   Wall thickness: exactly 1 pixel. Interior is always transparent (black).
+//   Shape boundary always large enough to show all 4 walls: minimum
+//   rendered dimension 2x2 pixels (hw>=1, hh>=1), maximum 8x8 (hw<=4,hh<=4).
+//
+//   Per-shape behaviour
+//     Movement   : each shape has a constant velocity vector (vx, vy).
+//                  Direction is one of: pure X, pure Y, or one of 4
+//                  diagonals (45deg). Speed varies per shape. Direction
+//                  and speed only change at a scheduled reversal interval,
+//                  keeping motion smooth and predictable.
+//     Morphing   : hw and hh are driven by independent sine oscillators
+//                  at different rates. No sudden jumps -- purely smooth.
+//     Boundary   : shapes always partially extend beyond the matrix edge.
+//                  When the centre drifts too far out, it wraps to the
+//                  opposite side so shapes re-enter continuously.
+//
+//   Rendering -- painter's algorithm
+//     Shapes drawn back-to-front. At any pixel the frontmost shape wall
+//     that covers it wins. Interiors are transparent -- you see through
+//     to shapes beneath, making nested/overlapping rects clearly visible.
+//     No dimming, no blending, no border effects.
+//
+//   Colour palettes
+//     5 palettes of GEO_NUM_SHAPES colours. Every GEO_PAL_CYCLE_MS ms
+//     the active palette snaps to the next -- no cross-fade, clean cut.
+//
+//   Beat modulation
+//     A beat triggers a temporary speed boost on all shapes for ~8 frames.
+// =============================================================================
+#elif ACTIVE_MODE == MODE_GEOMETRIC
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+#define GEO_NUM_SHAPES     5       // number of simultaneous rectangles
+
+// Speed table: 8 possible speed magnitudes (pixels/frame).
+// Each shape picks one independently. Higher = faster.
+#define GEO_SPEED_MIN      0.08f   // slowest shape speed
+#define GEO_SPEED_MAX      0.28f   // fastest shape speed
+
+// Size oscillation: half-extents vary between these limits via sine wave
+#define GEO_HW_MIN         1.0f    // minimum half-width  (renders as 2px wide)
+#define GEO_HW_MAX         4.0f    // maximum half-width  (renders as 8px wide)
+#define GEO_HH_MIN         1.0f    // minimum half-height (renders as 2px tall)
+#define GEO_HH_MAX         4.0f    // maximum half-height (renders as 8px tall)
+
+// Morph: independent sine rates per dimension, per shape
+#define GEO_OSC_FREQ_MIN   0.008f  // slowest size oscillation (rad/frame)
+#define GEO_OSC_FREQ_MAX   0.035f  // fastest size oscillation (rad/frame)
+
+// Direction change: each shape reverses or picks new direction every N frames
+#define GEO_DIR_CHANGE_MIN  180    // minimum frames before direction change
+#define GEO_DIR_CHANGE_MAX  420    // maximum frames before direction change
+
+// Wrap margin: how far past the edge the centre can go before wrapping
+#define GEO_WRAP_MARGIN    5.0f
+
+// Palette
+#define GEO_NUM_PALETTES   5
+#define GEO_PAL_CYCLE_MS   60000UL  // ms between palette snaps
+
+// Beat
+#define GEO_BEAT_BOOST     2.2f     // speed multiplier on beat
+#define GEO_BEAT_DECAY     0.88f    // boost decay per frame
+
+// ── Movement directions ───────────────────────────────────────────────────────
+// 8 axis-aligned or diagonal unit vectors. No rotation, just these 8.
+static const float _geoDirX[8] = { 1, 0,-1, 0, 1,-1,-1, 1 };
+static const float _geoDirY[8] = { 0, 1, 0,-1, 1, 1,-1,-1 };
+// Diagonal unit vectors are ~0.707 per component; normalise so speed is consistent
+static const float _geoDirScale[8] = {
+    1.0f, 1.0f, 1.0f, 1.0f,
+    0.7071f, 0.7071f, 0.7071f, 0.7071f
+};
+
+// ── Colour palettes ───────────────────────────────────────────────────────────
+static const uint8_t _geoPalettes[GEO_NUM_PALETTES][GEO_NUM_SHAPES][3] = {
+    // 0: Ember
+    { {200, 20,  5}, {230, 90, 10}, {255,150, 20}, {210, 55,  0}, {245,120, 35} },
+    // 1: Arctic
+    { { 15, 85,190}, { 10,145,225}, { 55,205,245}, {  5, 55,165}, {145,215,255} },
+    // 2: Verdant
+    { { 10,105, 30}, { 25,165, 50}, { 75,225, 80}, {  5, 75, 20}, {135,205, 60} },
+    // 3: Dusk
+    { {105, 10,165}, {175, 20,205}, {225, 60,185}, { 60,  5,125}, {205,100,235} },
+    // 4: Mineral
+    { { 20,145,135}, {185,155, 20}, { 55,185,165}, {155,115, 10}, {100,205,195} },
+};
+
+// ── Shape ─────────────────────────────────────────────────────────────────────
+struct GeoShape {
+    float   cx, cy;        // centre (float, may be outside matrix)
+    float   hw, hh;        // current half-extents (float, clamped on render)
+    float   hwBase, hhBase;// midpoint of oscillation range
+    float   hwAmp,  hhAmp; // amplitude of sine oscillation
+    float   oscPhW, oscPhH;// oscillator phase (radians)
+    float   oscFrW, oscFrH;// oscillator frequency (rad/frame)
+    float   speed;         // magnitude (pixels/frame)
+    uint8_t dirIdx;        // index into _geoDirX/Y (0-7)
+    int     dirTimer;      // frames until next direction change
+    float   beatBoost;     // current speed multiplier from beat (decays to 1.0)
+    uint8_t palIdx;        // palette colour slot
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static GeoShape _geoShapes[GEO_NUM_SHAPES];
+static uint8_t  _geoCurPal = 0;
+static uint32_t _geoPalEnd = 0;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+static inline float _geoRandRange(float lo, float hi) {
+    return lo + ((float)random8() / 255.0f) * (hi - lo);
+}
+
+static void _geoSpawnShape(int i) {
+    GeoShape& s = _geoShapes[i];
+
+    // Start on-screen, possibly near an edge
+    s.cx = _geoRandRange(0.5f, (float)(MATRIX_COLS - 1) + 0.5f);
+    s.cy = _geoRandRange(0.5f, (float)(MATRIX_ROWS - 1) + 0.5f);
+
+    // Size: midpoint and amplitude for each oscillator dimension
+    // Ensure midpoint +/- amplitude stays within [MIN..MAX]
+    float hwMid = _geoRandRange(GEO_HW_MIN + 0.8f, GEO_HW_MAX - 0.8f);
+    float hhMid = _geoRandRange(GEO_HH_MIN + 0.8f, GEO_HH_MAX - 0.8f);
+    float hwA   = _geoRandRange(0.5f, fminf(hwMid - GEO_HW_MIN, GEO_HW_MAX - hwMid));
+    float hhA   = _geoRandRange(0.5f, fminf(hhMid - GEO_HH_MIN, GEO_HH_MAX - hhMid));
+    s.hwBase = hwMid; s.hwAmp = hwA;
+    s.hhBase = hhMid; s.hhAmp = hhA;
+    s.oscPhW = _geoRandRange(0, 2.0f * (float)M_PI);
+    s.oscPhH = _geoRandRange(0, 2.0f * (float)M_PI);
+    s.oscFrW = _geoRandRange(GEO_OSC_FREQ_MIN, GEO_OSC_FREQ_MAX);
+    s.oscFrH = _geoRandRange(GEO_OSC_FREQ_MIN, GEO_OSC_FREQ_MAX);
+
+    // Movement
+    s.speed    = _geoRandRange(GEO_SPEED_MIN, GEO_SPEED_MAX);
+    s.dirIdx   = random8(8);
+    s.dirTimer = GEO_DIR_CHANGE_MIN +
+                 (int)(((float)random8() / 255.0f) *
+                       (float)(GEO_DIR_CHANGE_MAX - GEO_DIR_CHANGE_MIN));
+    s.beatBoost = 1.0f;
+    s.palIdx    = (uint8_t)i;
+
+    // Compute initial hw/hh
+    s.hw = s.hwBase + s.hwAmp * sinf(s.oscPhW);
+    s.hh = s.hhBase + s.hhAmp * sinf(s.oscPhH);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+static void _geoInit() {
+    for (int i = 0; i < GEO_NUM_SHAPES; i++) _geoSpawnShape(i);
+    _geoCurPal = 0;
+    _geoPalEnd = millis() + GEO_PAL_CYCLE_MS;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+static void renderGeometric() {
+    uint32_t now = millis();
+
+    // ── Palette snap ─────────────────────────────────────────────────────────
+    if (now >= _geoPalEnd) {
+        _geoCurPal = (_geoCurPal + 1) % GEO_NUM_PALETTES;
+        _geoPalEnd = now + GEO_PAL_CYCLE_MS;
+    }
+
+    // ── Beat: boost all shapes briefly ───────────────────────────────────────
+    if (beatFired) {
+        for (int i = 0; i < GEO_NUM_SHAPES; i++)
+            _geoShapes[i].beatBoost = GEO_BEAT_BOOST;
+    }
+
+    // ── Update all shapes ─────────────────────────────────────────────────────
+    for (int i = 0; i < GEO_NUM_SHAPES; i++) {
+        GeoShape& s = _geoShapes[i];
+
+        // Decay beat boost
+        if (s.beatBoost > 1.01f) s.beatBoost *= GEO_BEAT_DECAY;
+        else                      s.beatBoost  = 1.0f;
+
+        // Direction change timer
+        s.dirTimer--;
+        if (s.dirTimer <= 0) {
+            // Pick a new direction that differs from current
+            uint8_t newDir;
+            do { newDir = random8(8); } while (newDir == s.dirIdx);
+            s.dirIdx   = newDir;
+            s.speed    = _geoRandRange(GEO_SPEED_MIN, GEO_SPEED_MAX);
+            s.dirTimer = GEO_DIR_CHANGE_MIN +
+                         (int)(((float)random8() / 255.0f) *
+                               (float)(GEO_DIR_CHANGE_MAX - GEO_DIR_CHANGE_MIN));
+        }
+
+        // Move
+        float spd = s.speed * s.beatBoost;
+        s.cx += _geoDirX[s.dirIdx] * _geoDirScale[s.dirIdx] * spd;
+        s.cy += _geoDirY[s.dirIdx] * _geoDirScale[s.dirIdx] * spd;
+
+        // Wrap: when centre moves too far past any edge, re-enter from opposite side
+        float wm = GEO_WRAP_MARGIN;
+        float mw = (float)MATRIX_COLS, mh = (float)MATRIX_ROWS;
+        if (s.cx < -wm)      s.cx += mw + wm * 2.0f;
+        if (s.cx > mw + wm)  s.cx -= mw + wm * 2.0f;
+        if (s.cy < -wm)      s.cy += mh + wm * 2.0f;
+        if (s.cy > mh + wm)  s.cy -= mh + wm * 2.0f;
+
+        // Morph size via sine oscillators
+        s.oscPhW += s.oscFrW;
+        s.oscPhH += s.oscFrH;
+        s.hw = s.hwBase + s.hwAmp * sinf(s.oscPhW);
+        s.hh = s.hhBase + s.hhAmp * sinf(s.oscPhH);
+        // Clamp to valid range
+        s.hw = fmaxf(GEO_HW_MIN, fminf(GEO_HW_MAX, s.hw));
+        s.hh = fmaxf(GEO_HH_MIN, fminf(GEO_HH_MAX, s.hh));
+    }
+
+    // ── Render: painter's algorithm back-to-front ─────────────────────────────
+    // Pixel ownership: -1 = background (black), 0..N-1 = shape index
+    static int8_t _geoOwner[MATRIX_COLS][MATRIX_ROWS];
+    for (int c = 0; c < MATRIX_COLS; c++)
+        for (int r = 0; r < MATRIX_ROWS; r++)
+            _geoOwner[c][r] = -1;
+
+    for (int i = 0; i < GEO_NUM_SHAPES; i++) {
+        GeoShape& s = _geoShapes[i];
+
+        // Convert float centre + half-extents to integer pixel bounds
+        // Round centre to nearest half-pixel for smooth but crisp motion
+        int x0 = (int)roundf(s.cx - s.hw);  // left wall col
+        int x1 = (int)roundf(s.cx + s.hw);  // right wall col
+        int y0 = (int)roundf(s.cy - s.hh);  // top wall row
+        int y1 = (int)roundf(s.cy + s.hh);  // bottom wall row
+
+        // Enforce minimum size: at least 2 pixels per dimension
+        if (x1 - x0 < 1) x1 = x0 + 1;
+        if (y1 - y0 < 1) y1 = y0 + 1;
+
+        // Draw exactly the 4 walls (1 pixel thick). Interior is NOT filled.
+        // Only draw pixels that fall on-screen.
+        // Top wall (y0): x0..x1
+        // Bottom wall (y1): x0..x1
+        // Left wall (x0): y0..y1
+        // Right wall (x1): y0..y1
+
+        for (int col = x0; col <= x1; col++) {
+            if (col < 0 || col >= MATRIX_COLS) continue;
+            if (y0 >= 0 && y0 < MATRIX_ROWS) _geoOwner[col][y0] = (int8_t)i;
+            if (y1 >= 0 && y1 < MATRIX_ROWS) _geoOwner[col][y1] = (int8_t)i;
+        }
+        for (int row = y0 + 1; row < y1; row++) {
+            if (row < 0 || row >= MATRIX_ROWS) continue;
+            if (x0 >= 0 && x0 < MATRIX_COLS) _geoOwner[x0][row] = (int8_t)i;
+            if (x1 >= 0 && x1 < MATRIX_COLS) _geoOwner[x1][row] = (int8_t)i;
+        }
+    }
+
+    // Write final pixel colours
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+
+    for (int col = 0; col < MATRIX_COLS; col++) {
+        for (int row = 0; row < MATRIX_ROWS; row++) {
+            int8_t si = _geoOwner[col][row];
+            if (si < 0) continue;
+            const uint8_t* c = _geoPalettes[_geoCurPal][(int)si];
+            matrix.drawPixel(col, DRAW_Y(row), matrix.Color(c[0], c[1], c[2]));
+        }
+    }
+}
+
+
+// =============================================================================
+// MODE_ASTEROIDS -- Asteroids-style drifting rocks with an evasive 3-pixel ship
+//
+// Architecture
+// ------------
+//   AST_NUM_ROCKS asteroids of varying radii (0-4) drift across the matrix.
+//   Each has a float centre, constant velocity vector (one of 8 directions),
+//   and a greyscale brightness. They wrap at the edges identical to MODE_GEOMETRIC.
+//
+//   Asteroid shapes are stored as compile-time pixel stamp tables: arrays of
+//   (dx, dy) integer offsets from the centre that approximate circles without
+//   anti-aliasing. Radius 0 = 1 pixel. Radius 4 = ~29 pixels (chunky circle).
+//
+//   The ship is exactly 3 pixels: a bright nose pixel and two dimmer rear
+//   pixels. Their positions are derived from the ship's integer centre (sx, sy)
+//   and heading direction (0-7, same direction table as MODE_GEOMETRIC).
+//   The ship moves at a fixed speed. Every AST_SHIP_THINK_FRAMES frames the
+//   ship AI evaluates whether its current heading will collide with any asteroid
+//   within AST_SHIP_LOOKAHEAD steps and steers toward the clearest heading.
+//
+//   Rendering: black background, asteroids drawn back-to-front (overlapping
+//   freely), ship drawn last so it always appears on top. No anti-aliasing.
+//
+//   Colour: asteroids are grey-scale with slight brightness variation matching
+//   the starfield palette. Ship nose = pure white, rear pixels = dim white.
+//
+//   Beat modulation: beat brightens all asteroids briefly and injects a small
+//   speed surge (same decay pattern as MODE_STARFIELD).
+// =============================================================================
+#elif ACTIVE_MODE == MODE_ASTEROIDS
+
+// ── Tuning ────────────────────────────────────────────────────────────────────
+#define AST_NUM_ROCKS          8    // number of asteroids
+#define AST_SPEED_MIN       0.06f   // slowest asteroid (pixels/frame)
+#define AST_SPEED_MAX       0.22f   // fastest asteroid (pixels/frame)
+#define AST_WRAP_MARGIN      6.0f   // pixels past edge before wrap
+#define AST_SHIP_SPEED      0.18f   // ship movement speed (pixels/frame)
+#define AST_SHIP_THINK_FRAMES  4    // frames between ship AI decisions
+#define AST_SHIP_LOOKAHEAD    14    // steps ahead the AI scans for collisions
+#define AST_BEAT_BRIGHT_BOOST 60    // extra brightness added on beat
+#define AST_BEAT_BRIGHT_DECAY 0.85f // brightness boost decay per frame
+#define AST_BEAT_SPEED_SURGE  1.6f  // speed multiplier on beat
+#define AST_BEAT_SPEED_DECAY  0.90f // speed boost decay per frame
+
+// ── Direction table (shared with geometric, redefined here) ───────────────────
+// 8 directions: E, SE, S, SW, W, NW, N, NE
+static const float _astDX[8] = { 1, 1, 0,-1,-1,-1, 0, 1 };
+static const float _astDY[8] = { 0, 1, 1, 1, 0,-1,-1,-1 };
+// Pre-normalised diagonal scale
+static const float _astDS[8] = {
+    1.0f, 0.7071f, 1.0f, 0.7071f,
+    1.0f, 0.7071f, 1.0f, 0.7071f
+};
+
+// ── Asteroid pixel stamps ─────────────────────────────────────────────────────
+// Each stamp is a list of (dx, dy) pixel offsets from the centre.
+// Hand-crafted to approximate circles of radius 0-4 with no anti-aliasing.
+// Intentionally rough — real Asteroids looked chunky.
+
+// Radius 0: single pixel
+static const int8_t _astR0[][2] = { {0,0} };
+
+// Radius 1: single pixel (halved from 3x3 cross)
+static const int8_t _astR1[][2] = {
+    {0,0}
+};
+
+// Radius 2: 5-pixel cross (halved from 5x5 blob)
+static const int8_t _astR2[][2] = {
+    {0,0},
+    {1,0},{-1,0},{0,1},{0,-1}
+};
+
+// Radius 3: 9-pixel filled 3x3 (halved from 7x7 circle)
+static const int8_t _astR3[][2] = {
+    {0,0},
+    {1,0},{-1,0},{0,1},{0,-1},
+    {1,1},{-1,1},{1,-1},{-1,-1}
+};
+
+// Radius 4: 13-pixel circle radius~2 (halved from 9x9 circle)
+static const int8_t _astR4[][2] = {
+    {0,0},
+    {1,0},{-1,0},{0,1},{0,-1},
+    {2,0},{-2,0},{0,2},{0,-2},
+    {1,1},{-1,1},{1,-1},{-1,-1}
+};
+
+#define _AST_R0_LEN  (sizeof(_astR0)/sizeof(_astR0[0]))
+#define _AST_R1_LEN  (sizeof(_astR1)/sizeof(_astR1[0]))
+#define _AST_R2_LEN  (sizeof(_astR2)/sizeof(_astR2[0]))
+#define _AST_R3_LEN  (sizeof(_astR3)/sizeof(_astR3[0]))
+#define _AST_R4_LEN  (sizeof(_astR4)/sizeof(_astR4[0]))
+
+// Pointer + length pair for runtime dispatch
+struct AstStamp { const int8_t (*pts)[2]; uint8_t len; };
+static const AstStamp _astStamps[5] = {
+    { _astR0, _AST_R0_LEN },
+    { _astR1, _AST_R1_LEN },
+    { _astR2, _AST_R2_LEN },
+    { _astR3, _AST_R3_LEN },
+    { _astR4, _AST_R4_LEN },
+};
+
+// ── Ship pixel layout per heading ─────────────────────────────────────────────
+// For each of 8 headings, define 3 pixel offsets from ship centre:
+//   [0] = nose (bright white)
+//   [1] = rear-left  (dim)
+//   [2] = rear-right (dim)
+// Heading indices match _astDX/DY: 0=E, 1=SE, 2=S, 3=SW, 4=W, 5=NW, 6=N, 7=NE
+static const int8_t _astShipPx[8][3][2] = {
+    // 0 E:  nose right, rears upper-left / lower-left
+    { { 1, 0}, {-1,-1}, {-1, 1} },
+    // 1 SE: nose lower-right, rears upper-left / upper-right  (roughly)
+    { { 1, 1}, {-1, 0}, { 0,-1} },
+    // 2 S:  nose down, rears upper-left / upper-right
+    { { 0, 1}, {-1,-1}, { 1,-1} },
+    // 3 SW: nose lower-left, rears upper-right / upper-left
+    { {-1, 1}, { 1, 0}, { 0,-1} },
+    // 4 W:  nose left, rears upper-right / lower-right
+    { {-1, 0}, { 1,-1}, { 1, 1} },
+    // 5 NW: nose upper-left, rears lower-right / lower-left
+    { {-1,-1}, { 1, 0}, { 0, 1} },
+    // 6 N:  nose up, rears lower-left / lower-right
+    { { 0,-1}, {-1, 1}, { 1, 1} },
+    // 7 NE: nose upper-right, rears lower-left / lower-right
+    { { 1,-1}, {-1, 0}, { 0, 1} },
+};
+
+// ── Rock ──────────────────────────────────────────────────────────────────────
+struct AstRock {
+    float   cx, cy;      // centre (float)
+    uint8_t radius;      // 0-4
+    uint8_t dirIdx;      // movement direction (0-7)
+    float   speed;       // pixels/frame base
+    uint8_t brightness;  // base greyscale brightness 130-240
+    float   brightBoost; // extra from beat (decays to 0)
+    float   speedBoost;  // extra speed multiplier from beat (decays to 1)
+};
+
+// ── Ship ──────────────────────────────────────────────────────────────────────
+struct AstShip {
+    float   cx, cy;      // centre (float)
+    uint8_t heading;     // 0-7
+    int     thinkTimer;  // counts down to next AI decision
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static AstRock  _astRocks[AST_NUM_ROCKS];
+static AstShip  _astShip;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+static inline float _astRandRange(float lo, float hi) {
+    return lo + ((float)random8() / 255.0f) * (hi - lo);
+}
+
+static inline void _astWrap(float& v, float lo, float hi) {
+    float range = hi - lo;
+    if (v < lo) v += range;
+    if (v >= hi) v -= range;
+}
+
+static void _astSpawnRock(int i, bool offscreen) {
+    AstRock& r = _astRocks[i];
+    if (offscreen) {
+        // Spawn at a random edge so it drifts into view
+        uint8_t edge = random8(4);
+        float m = AST_WRAP_MARGIN * 0.5f;
+        switch (edge) {
+            case 0: r.cx = _astRandRange(0, MATRIX_COLS); r.cy = -m; break;
+            case 1: r.cx = _astRandRange(0, MATRIX_COLS); r.cy = MATRIX_ROWS + m; break;
+            case 2: r.cx = -m; r.cy = _astRandRange(0, MATRIX_ROWS); break;
+            default: r.cx = MATRIX_COLS + m; r.cy = _astRandRange(0, MATRIX_ROWS); break;
+        }
+    } else {
+        r.cx = _astRandRange(1, MATRIX_COLS - 1);
+        r.cy = _astRandRange(1, MATRIX_ROWS - 1);
+    }
+    r.radius     = random8(5);           // 0-4
+    r.dirIdx     = random8(8);
+    r.speed      = _astRandRange(AST_SPEED_MIN, AST_SPEED_MAX);
+    r.brightness = 130 + random8(110);   // 130-240
+    r.brightBoost = 0.0f;
+    r.speedBoost  = 1.0f;
+}
+
+// Pixel occupancy check: is pixel (px, py) covered by rock i given its stamp?
+static bool _astRockCoversPixel(int i, int px, int py) {
+    AstRock& r = _astRocks[i];
+    int cx = (int)roundf(r.cx);
+    int cy = (int)roundf(r.cy);
+    const AstStamp& st = _astStamps[r.radius];
+    for (int k = 0; k < st.len; k++) {
+        if (cx + st.pts[k][0] == px && cy + st.pts[k][1] == py) return true;
+    }
+    return false;
+}
+
+// Check if any asteroid occupies pixel (px, py) — used by ship AI
+static bool _astAnyRockAt(int px, int py) {
+    for (int i = 0; i < AST_NUM_ROCKS; i++)
+        if (_astRockCoversPixel(i, px, py)) return true;
+    return false;
+}
+
+// Ship AI: scan heading for asteroid pixels, return safest heading
+static uint8_t _astPickHeading(float sx, float sy, uint8_t curHeading) {
+    // Try directions in order of preference: current, ±1, ±2, ±3, opposite
+    // Return first heading that is clear for AST_SHIP_LOOKAHEAD steps
+    const uint8_t tryOrder[8] = {0, 1, 7, 2, 6, 3, 5, 4}; // relative offsets
+
+    for (int t = 0; t < 8; t++) {
+        uint8_t h = (curHeading + tryOrder[t]) & 7;
+        bool clear = true;
+        float tx = sx, ty = sy;
+        for (int step = 1; step <= AST_SHIP_LOOKAHEAD; step++) {
+            tx += _astDX[h] * _astDS[h] * AST_SHIP_SPEED;
+            ty += _astDY[h] * _astDS[h] * AST_SHIP_SPEED;
+            // Wrap test position
+            float wtx = tx, wty = ty;
+            _astWrap(wtx, -AST_WRAP_MARGIN, MATRIX_COLS + AST_WRAP_MARGIN);
+            _astWrap(wty, -AST_WRAP_MARGIN, MATRIX_ROWS + AST_WRAP_MARGIN);
+            int ipx = (int)roundf(wtx);
+            int ipy = (int)roundf(wty);
+            // Check the 3 ship pixels that would be at this position
+            for (int p = 0; p < 3; p++) {
+                int spx = ipx + _astShipPx[h][p][0];
+                int spy = ipy + _astShipPx[h][p][1];
+                if (_astAnyRockAt(spx, spy)) { clear = false; break; }
+            }
+            if (!clear) break;
+        }
+        if (clear) return h;
+    }
+    // All directions blocked — maintain current (rare, just hold course)
+    return curHeading;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+static void _astInit() {
+    for (int i = 0; i < AST_NUM_ROCKS; i++) _astSpawnRock(i, false);
+    // Ship starts near centre
+    _astShip.cx         = (float)(MATRIX_COLS / 2);
+    _astShip.cy         = (float)(MATRIX_ROWS / 2);
+    _astShip.heading    = 0;
+    _astShip.thinkTimer = AST_SHIP_THINK_FRAMES;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+static void renderAsteroids() {
+
+    // ── Beat ──────────────────────────────────────────────────────────────────
+    if (beatFired) {
+        for (int i = 0; i < AST_NUM_ROCKS; i++) {
+            _astRocks[i].brightBoost = (float)AST_BEAT_BRIGHT_BOOST;
+            _astRocks[i].speedBoost  = AST_BEAT_SPEED_SURGE;
+        }
+    }
+
+    // ── Update rocks ──────────────────────────────────────────────────────────
+    for (int i = 0; i < AST_NUM_ROCKS; i++) {
+        AstRock& r = _astRocks[i];
+
+        // Decay beat effects
+        if (r.brightBoost > 0.5f) r.brightBoost *= AST_BEAT_BRIGHT_DECAY;
+        else r.brightBoost = 0.0f;
+        if (r.speedBoost > 1.01f) r.speedBoost *= AST_BEAT_SPEED_DECAY;
+        else r.speedBoost = 1.0f;
+
+        // Move
+        float spd = r.speed * r.speedBoost;
+        r.cx += _astDX[r.dirIdx] * _astDS[r.dirIdx] * spd;
+        r.cy += _astDY[r.dirIdx] * _astDS[r.dirIdx] * spd;
+
+        // Wrap
+        float lo = -AST_WRAP_MARGIN, hiX = MATRIX_COLS + AST_WRAP_MARGIN;
+        float hiY = MATRIX_ROWS + AST_WRAP_MARGIN;
+        _astWrap(r.cx, lo, hiX);
+        _astWrap(r.cy, lo, hiY);
+    }
+
+    // ── Ship AI ───────────────────────────────────────────────────────────────
+    _astShip.thinkTimer--;
+    if (_astShip.thinkTimer <= 0) {
+        _astShip.heading    = _astPickHeading(_astShip.cx, _astShip.cy,
+                                               _astShip.heading);
+        _astShip.thinkTimer = AST_SHIP_THINK_FRAMES;
+    }
+
+    // Move ship
+    _astShip.cx += _astDX[_astShip.heading] * _astDS[_astShip.heading] * AST_SHIP_SPEED;
+    _astShip.cy += _astDY[_astShip.heading] * _astDS[_astShip.heading] * AST_SHIP_SPEED;
+    _astWrap(_astShip.cx, -AST_WRAP_MARGIN, MATRIX_COLS + AST_WRAP_MARGIN);
+    _astWrap(_astShip.cy, -AST_WRAP_MARGIN, MATRIX_ROWS + AST_WRAP_MARGIN);
+
+    // ── Draw ──────────────────────────────────────────────────────────────────
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+
+    // Draw asteroids (back-to-front, they overlap freely)
+    for (int i = 0; i < AST_NUM_ROCKS; i++) {
+        AstRock& r   = _astRocks[i];
+        int cx       = (int)roundf(r.cx);
+        int cy       = (int)roundf(r.cy);
+        uint8_t bri  = (uint8_t)fminf(255.0f, (float)r.brightness + r.brightBoost);
+        // Slight blue tint for larger rocks (matching starfield colour feel)
+        // Small rocks are pure grey; large rocks have a faint cold cast
+        uint8_t rv = (uint8_t)(bri * (1.0f - r.radius * 0.025f));
+        uint8_t gv = (uint8_t)(bri * (1.0f - r.radius * 0.015f));
+        uint8_t bv = bri;
+        uint16_t col16 = matrix.Color(rv, gv, bv);
+
+        const AstStamp& st = _astStamps[r.radius];
+        for (int k = 0; k < st.len; k++) {
+            int px = cx + st.pts[k][0];
+            int py = cy + st.pts[k][1];
+            if (px >= 0 && px < MATRIX_COLS && py >= 0 && py < MATRIX_ROWS)
+                matrix.drawPixel(px, DRAW_Y(py), col16);
+        }
+    }
+
+    // Draw ship on top (always visible)
+    int sx = (int)roundf(_astShip.cx);
+    int sy = (int)roundf(_astShip.cy);
+    uint8_t h = _astShip.heading;
+    for (int p = 0; p < 3; p++) {
+        int px = sx + _astShipPx[h][p][0];
+        int py = sy + _astShipPx[h][p][1];
+        if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS) continue;
+        // Nose = pure white, rear pixels = dim white
+        uint8_t bri = (p == 0) ? 255 : 160;
+        matrix.drawPixel(px, DRAW_Y(py), matrix.Color(bri, bri, bri));
+    }
+}
+
+
 #endif // end of mode implementations
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1647,6 +2263,10 @@ void visualizerInit() {
     _sfAccelBoost = 0.0f;
 #elif ACTIVE_MODE == MODE_DUNE
     _duneInit();
+#elif ACTIVE_MODE == MODE_GEOMETRIC
+    _geoInit();
+#elif ACTIVE_MODE == MODE_ASTEROIDS
+    _astInit();
 #endif
 }
 
@@ -1697,6 +2317,10 @@ void visualizerUpdate() {
     renderStarfield();
 #elif ACTIVE_MODE == MODE_DUNE
     renderDune();
+#elif ACTIVE_MODE == MODE_GEOMETRIC
+    renderGeometric();
+#elif ACTIVE_MODE == MODE_ASTEROIDS
+    renderAsteroids();
 #endif
 
     matrix.show();

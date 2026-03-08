@@ -37,6 +37,8 @@
  *   MODE_RAIN              Falling rain streaks, grey-blue, ghost trails, lightning
  *   MODE_STARFIELD         Classic warp-speed starfield, accelerating outward from center
  *   MODE_DUNE               Desert dune ridges, sand palette, slow S-curve morphing, dust twinkles
+ *   MODE_GEOMETRIC           Overlapping rectangles, colour palette cycles, jiggle and migrate
+ *   MODE_ASTEROIDS          Asteroids-style drifting rocks with an evasive 3-pixel ship
  *
  * ══════════════════════════════════════════════════════════════════════════════
  * BEAT DETECTION
@@ -55,7 +57,7 @@
 #include <Adafruit_NeoMatrix.h>
 
 // ── Active mode — change this one line ───────────────────────────────────────
-#define ACTIVE_MODE  MODE_DUNE
+#define ACTIVE_MODE  MODE_ASTEROIDS
 
 // ── Mode identifiers ─────────────────────────────────────────────────────────
 #define MODE_SPECTRUM              0
@@ -102,3 +104,5 @@ void visualizerUpdate();
 #define MODE_RAIN                 24
 #define MODE_STARFIELD            25
 #define MODE_DUNE                 26
+#define MODE_GEOMETRIC            27
+#define MODE_ASTEROIDS            28
