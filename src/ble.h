@@ -46,7 +46,7 @@
 #include <Arduino.h>
 
 // ── Master enable ─────────────────────────────────────────────────────────────
-#define BLE_ENABLED  0
+#define BLE_ENABLED  1
 
 // ── Device name (advertised over BLE) ────────────────────────────────────────
 #define BLE_DEVICE_NAME  "LedMatrix"
