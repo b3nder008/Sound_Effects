@@ -99,7 +99,7 @@
 #include "buttons.h"
 #include "ble.h"
 
-#define DEBUG_SERIAL  1
+#define DEBUG_SERIAL  0
 
 #if DEBUG_SERIAL
   #define DPRINT(x)   do { if (Serial) Serial.print(x);   } while(0)
