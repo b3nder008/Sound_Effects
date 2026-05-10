@@ -125,3 +125,4 @@ void visualizerUpdate();
 void visualizerSetMode(uint8_t mode);  // runtime mode switch
 uint8_t visualizerModeCount();         // returns _VMODE_COUNT
 const char* visualizerModeName(uint8_t mode); // returns description string
+void visualizerBlank();   // blank the matrix immediately, call on power-off

@@ -124,6 +124,13 @@ static void dimAll(CRGB* leds, uint8_t value) {
     for (int i = 0; i < NUM_LEDS; i++) leds[i].nscale8(value);
 }
 
+void visualizerBlank() {
+    matrix.fillScreen(0);
+    matrix.show();
+    // Reset FFT bands so first frame after power-on is clean
+    memset(bandMagnitude, 0, sizeof(bandMagnitude));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // MODE_SPECTRUM — audio spectrum analyser bars
 // Unchanged from the original working implementation.

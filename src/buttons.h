@@ -21,6 +21,13 @@
  *   USB-CDC  : internal, no GPIO conflict
  *   SPI/I2C  : D4/D5 double as SDA/SCL but are free when I2C unused
  *
+ * ── Pin constant type ──────────────────────────────────────────────────────
+ *
+ * BTN_xxx_PIN constants are declared as const int, matching the ESP32
+ * Arduino API (pinMode / digitalRead both take int). The D3/D4/D5 board
+ * constants are uint32_t — assigning them to int is safe for all XIAO
+ * GPIO numbers and avoids implicit narrowing to uint8_t.
+ *
  * ── Debug bypass ───────────────────────────────────────────────────────────
  *
  * Set BUTTONS_ENABLED 0 to compile out all button hardware and logic.
@@ -35,23 +42,23 @@
  * ── Mode ordering ──────────────────────────────────────────────────────────
  *
  * BTN_MODE steps through the MODE_TABLE array in buttons.cpp.
- * Edit that array to choose which effects are included and in what order.
- * The table is independent of the visualizer's compile-time ACTIVE_MODE —
- * at runtime the current mode index drives visualizerSetMode().
+ * Edit VISUALIZER_MODE_TABLE in visualizer.h to choose which effects are
+ * included and in what order. Comment out a row there to exclude a mode.
  *
  * ── Brightness levels ──────────────────────────────────────────────────────
  *
  * BTN_BRIGHT steps through BRIGHTNESS_LEVELS[] in buttons.cpp.
  * Default steps: 30, 80, 150, 255.
  *
- * ── Power button ───────────────────────────────────────────────────────────
+ * ── Power button behaviour ─────────────────────────────────────────────────
  *
- * Short press: toggle display on/off. Matrix goes dark but audio and
- * beat detection keep running so the display is instantly reactive
- * when turned back on.
+ * Short press  : toggle display on/off. Matrix goes dark but audio and beat
+ *                detection keep running so the display is instantly reactive
+ *                when turned back on.
  *
- * Long press (hold > BTN_POWER_LONG_MS): not yet used — reserved for
- * future deep-sleep or reboot.
+ * Long press   : hold > BTN_POWER_LONG_MS. Currently reserved — add
+ *                deep-sleep or reboot in buttonsUpdate() where marked.
+ *                Long press suppresses the short-press toggle on release.
  */
 
 #include "button.h"
@@ -61,23 +68,25 @@
 // 1 = full button support
 #define BUTTONS_ENABLED  1
 
-// ── GPIO pins ─────────────────────────────────────────────────────────────────
-#define BTN_MODE_PIN    D3   // GPIO5
-#define BTN_POWER_PIN   D4   // GPIO6
-#define BTN_BRIGHT_PIN  D5   // GPIO7
+
+// ── GPIO pins — const int matches ESP32 Arduino digitalRead/pinMode API ───────
+const int BTN_POWER_PIN  = D2;   // GPIO3 — strapping pin, safe after boot
+const int BTN_MODE_PIN   = D8;   // GPIO44 - UART RX, see ⚠ warning in header
+const int BTN_BRIGHT_PIN = D7;   // GPIO7 — clean general-purpose GPIO
+
 
 // ── Timing ────────────────────────────────────────────────────────────────────
-#define BTN_POWER_LONG_MS  2000   // hold duration for long-press (reserved)
+const uint32_t BTN_POWER_LONG_MS = 2000;   // hold duration for long-press
 
 // ── Public API ────────────────────────────────────────────────────────────────
-void buttonsInit();
-void buttonsUpdate();         // call every loop() before audioUpdate()
+void    buttonsInit();
+void    buttonsUpdate();          // call every loop() before audioUpdate()
 
-bool buttonsPowerOn();        // returns false when display is blanked
-uint8_t buttonsBrightness();  // current brightness 0-255
-uint8_t buttonsCurrentMode(); // current mode index into MODE_TABLE
+bool    buttonsPowerOn();         // false when display is blanked
+uint8_t buttonsBrightness();      // current brightness 0-255
+uint8_t buttonsCurrentMode();     // current mode constant (MODE_xxx)
 
-// ── Setters (called by BLE and any other runtime control source) ──────────
-void buttonsSetPower(bool on);          // set display on/off directly
-void buttonsSetBrightness(uint8_t bri); // set brightness 0-255 directly
-void buttonsSetMode(uint8_t modeId);    // set mode by MODE_xxx constant
+// ── Setters (called by BLE and any other runtime control source) ──────────────
+void buttonsSetPower(bool on);
+void buttonsSetBrightness(uint8_t bri);
+void buttonsSetMode(uint8_t modeId);

@@ -2,9 +2,9 @@
 #include <Arduino.h>
 
 // Connections to INMP441 I2S microphone
-#define I2S_WS_PIN  D6    // INMP441 pin: WS  (also called LRCK)
-#define I2S_SCK_PIN D7    // INMP441 pin: SCK (bit clock)
-#define I2S_SD_PIN  D2    // INMP441 pin: SD  (data out from mic)
+#define I2S_WS_GPIO    4    // D3 = GPIO4  WS (LRCK)
+#define I2S_SCK_GPIO   5    // D4 = GPIO5  SCK (BCLK)
+#define I2S_SD_GPIO    6    // D5 = GPIO6  SD (data)
 
 // Audio config
 #define SAMPLE_RATE       16000

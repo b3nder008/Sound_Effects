@@ -25,12 +25,13 @@ bool audioInit() {
         .fixed_mclk           = 0
     };
 
-    i2s_pin_config_t pin_config = {
-        .bck_io_num   = I2S_SCK_PIN,
-        .ws_io_num    = I2S_WS_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num  = I2S_SD_PIN
-    };
+
+i2s_pin_config_t pin_config = {
+    .bck_io_num   = I2S_SCK_GPIO,
+    .ws_io_num    = I2S_WS_GPIO,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_SD_GPIO
+};
 
     esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     if (err != ESP_OK) return false;
