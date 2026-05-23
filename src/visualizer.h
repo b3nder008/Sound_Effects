@@ -87,14 +87,11 @@
     X(MODE_CONFETTI,             "Confetti speckles")                 \
     X(MODE_PRIDE,                "Pride shifting rainbow")            \
     X(MODE_COLOR_WAVES,          "Color waves")                       \
-    X(MODE_RAINBOW,              "Rainbow")                           \
-    X(MODE_RAINBOW_GLITTER,      "Rainbow + glitter")                 \
-    X(MODE_HUE_CYCLE,            "Hue cycle solid")                   \
     X(MODE_CLOUD_TWINKLES,       "Cloud twinkles")                    \
     X(MODE_RAINBOW_TWINKLES,     "Rainbow twinkles")                  \
     X(MODE_SINELON,              "Sinelon dot")                       \
     X(MODE_JUGGLE,               "Juggle dots")                       \
-
+    X(MODE_LIFE,                 "Conway's Game of Life")             \
 // ── Auto-generate numeric IDs from the table ──────────────────────────────────
 // Each MODE_xxx constant equals its zero-based position in the table.
 // Never assign these manually — let the enum do it.

@@ -9,7 +9,7 @@
 // Audio config
 #define SAMPLE_RATE       16000
 #define FFT_SIZE          512         // Must be power of 2
-#define DMA_BUF_COUNT     4           // Number of DMA buffers
+#define DMA_BUF_COUNT     6           // Number of DMA buffers
 #define DMA_BUF_LEN       256         // Samples per DMA buffer
 #define DOUBLE_BUF_SIZE   FFT_SIZE    // Samples per processing buffer
 

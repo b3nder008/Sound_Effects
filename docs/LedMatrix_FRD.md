@@ -34,7 +34,7 @@ buttons on the device.
 
 | Term | Meaning |
 |------|---------|
-| **Device** | The XIAO ESP32-C3 with attached LED matrix |
+| **Device** | The XIAO ESP32-S3 with attached LED matrix |
 | **Central** | The iPhone (the controller in BLE terminology) |
 | **Peripheral** | The Device (the server in BLE terminology) |
 | **Characteristic** | A single data value inside the BLE service |

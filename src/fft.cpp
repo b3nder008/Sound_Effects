@@ -1,16 +1,17 @@
 #include "fft.h"
 #include "audio.h"
 #include <arduinoFFT.h>
-
+ 
 // ─── FFT Buffers ──────────────────────────────────────────────────────────────
 // arduinoFFT v2.x: class is now a template named ArduinoFFT<T>.
 // Buffers are passed at construction and must match the template type.
 static double vReal[FFT_SIZE];
 static double vImag[FFT_SIZE];
 static ArduinoFFT<double> FFT(vReal, vImag, FFT_SIZE, SAMPLE_RATE);
-
+ 
 float bandMagnitude[NUM_BANDS] = {0};
-
+float bandRaw[NUM_BANDS]       = {0};
+ 
 // ─── Perceptual Band Bin Ranges ───────────────────────────────────────────────
 // Bin = frequency / (SAMPLE_RATE / FFT_SIZE) = frequency / 31.25
 // Limits below are [startBin, endBin) inclusive of start, exclusive of end.
@@ -34,91 +35,287 @@ static const uint16_t bandBinEnd[NUM_BANDS] = {
    224,   //   7 kHz
    256    //   8 kHz (Nyquist for 16 kHz SR)
 };
-
+ 
 // ─── Peak tracking for normalisation ─────────────────────────────────────────
 static float peakHold[NUM_BANDS];
-#define PEAK_DECAY  0.998f   // Slower decay — prevents AGC pumping on transients
-
-// Per-band noise floor: measured in silence, max observed x 2.0 safety margin.
-// Any band average below this value is clamped to zero before normalisation.
-static const float NOISE_FLOOR[NUM_BANDS] = {
-    16800.0f,  // B0  sub-bass   — high EMI / board pickup
-    15200.0f,  // B1  bass       — noisy
-    22500.0f,  // B2  low-mid    — noisiest, likely 60 Hz harmonic coupling
-     7700.0f,  // B3  mid
-     2900.0f,  // B4  upper-mid  — clean, drops sharply here
-      870.0f,  // B5  presence
-      615.0f,  // B6  brilliance
-      515.0f,  // B7  air
+#define PEAK_DECAY  0.990f   // ~2.2 s half-life at 31 fps — fast enough for dynamic range recovery
+ 
+// ─── Noise floor seed / static floor ─────────────────────────────────────────
+// Calibrated on ESP32-S3 XIAO + INMP441 + 22Ω + 1µF RC filter.
+// Derived from 4 calibration runs (R1/R2 unfiltered, R3/R4 RC-filtered).
+// Values = R3+R4 p95 average × 2.0.  Re-measure if hardware changes.
+static const float NOISE_FLOOR_STATIC[NUM_BANDS] = {
+     1990.6f,  // B0  sub-bass    85 Hz  R3+R4 avg ×1.10
+      958.2f,  // B1  bass       275 Hz  R3+R4 avg ×1.10
+      344.3f,  // B2  low-mid   600 Hz  R3+R4 avg ×1.10
+      196.7f,  // B3  mid      1400 Hz  R3+R4 avg ×1.10
+      135.7f,  // B4  upper-mid 3000 Hz  R3+R4 avg ×1.10
+      120.6f,  // B5  presence  5000 Hz  R3+R4 avg ×1.10
+      132.0f,  // B6  brilliance 7000 Hz  ×1.10
+      110.7f,  // B7  air       7500 Hz  ×1.10
 };
-
-// Per-band sensitivity multiplier applied after AGC normalisation.
-// The AGC produces 0.0-1.0 per band. This scales it before the renderer sees it,
-// clamped to 1.0 so bars never exceed full height.
-//
-// Why needed even with AGC:
-//   After noise floor subtraction, low bands have compressed headroom and the
-//   AGC takes time to re-calibrate after quiet passages. High bands carry less
-//   raw energy in typical music and would otherwise stay dim.
-//
-// 1.0 = neutral. Raise to make a band more responsive, lower to tame it.
-// Tune by ear with a track that has clear kick, snare, vocals, and hi-hats.
+ 
+// ─── Per-band sensitivity ─────────────────────────────────────────────────────
+// Multiplier applied after AGC normalisation, clamped to 1.0.
+// Derived from R3+R4 tone-peak vs floor SNR ratios.
 static const float SENSITIVITY[NUM_BANDS] = {
-    1.0f,   // B0  sub-bass   — kick drum fills this naturally
-    1.0f,   // B1  bass
-    1.0f,   // B2  low-mid    — watch for false triggers if raised
-    1.2f,   // B3  mid        — slight boost, snare and vocals
-    1.4f,   // B4  upper-mid  — often under-represented
-    1.8f,   // B5  presence   — high freqs have less raw energy
-    2.0f,   // B6  brilliance
-    2.0f,   // B7  air        — nearly always dark without a boost
+    2.000f,  // B0  sub-bass   — conservative start; raise with kick drum music
+    1.080f,  // B1  bass       — R3+R4 confirmed
+    1.277f,  // B2  low-mid    — R3+R4 confirmed
+    0.800f,  // B3  mid        — reference band, slightly attenuated
+    3.305f,  // B4  upper-mid  — lower to 2.0 if presence feels harsh
+    4.000f,  // B5  presence   — at cap; mic rolls off here; tune by ear
+    4.000f,  // B6  brilliance — at cap; mic rolloff; tune by ear
+    4.000f,  // B7  air        — at cap; near Nyquist; tune by ear
 };
 
+// ─── Per-band adaptive floor minimum ─────────────────────────────────────────
+// Clamps adaptedFloor[] so it never collapses below measured ambient.
+// Values ≈ half of R3 p95 per band.
+static const float FLOOR_MIN[NUM_BANDS] = {
+      442.3f,  // B0  ×1.10
+      216.2f,  // B1  ×1.10
+       65.2f,  // B2  ×1.10
+       39.7f,  // B3  ×1.10
+       33.8f,  // B4  ×1.10
+       30.1f,  // B5  ×1.10
+       33.0f,  // B6  ×1.10
+       27.5f,  // B7  ×1.10
+};
+
+// ─── Per-band adaptive floor rise coefficient ─────────────────────────────────
+// Applied when raw > adaptedFloor (floor tracking up toward noise/signal).
+// Lower = faster rise (more aggressive noise gating).
+// Replaces global FFT_FLOOR_RISE_COEFF define.
+static const float FLOOR_RISE_COEFF[NUM_BANDS] = {
+    0.997f,  // B0  — RC filter handles EMI; slow rise so kick drums aren't eaten
+    0.995f,  // B1  — same reasoning; was 0.85 (chased transients too fast)
+    0.97f,   // B2
+    0.97f,   // B3
+    0.95f,   // B4
+    0.92f,   // B5
+    0.90f,   // B6
+    0.88f,   // B7
+};
+
+// ─── Per-band output IIR smoothing ───────────────────────────────────────────
+// Weight applied to the previous bandMagnitude[] sample.
+// Higher = more smoothing (slower response). Lower = faster/noisier.
+static const float BAND_SMOOTH[NUM_BANDS] = {
+    0.55f,  // B0  — faster response for kick drums
+    0.60f,  // B1
+    0.50f,  // B2
+    0.50f,  // B3
+    0.55f,  // B4
+    0.60f,  // B5
+    0.65f,  // B6
+    0.70f,  // B7
+};
+
+// ─── Per-band trust flag ──────────────────────────────────────────────────────
+// 1 = band data is reliable for visualisation. 0 = too noisy; skip or dim.
+// All bands trusted post RC filter. Exposed via fft.h extern declaration.
+extern const uint8_t BAND_TRUSTED[NUM_BANDS];
+const uint8_t BAND_TRUSTED[NUM_BANDS] = {
+    1,  // B0  sub-bass   — confirmed post RC filter
+    1,  // B1  bass
+    1,  // B2  low-mid
+    1,  // B3  mid
+    1,  // B4  upper-mid
+    1,  // B5  presence
+    1,  // B6  brilliance
+    1,  // B7  air
+};
+ 
+// ═════════════════════════════════════════════════════════════════════════════
+// AUTO-CALIBRATION BLOCK
+// Everything inside this #if is compiled out when FFT_AUTO_CALIBRATE 0.
+// ═════════════════════════════════════════════════════════════════════════════
+#if FFT_AUTO_CALIBRATE
+ 
+// Active noise floor — starts at static values, updated by calibration and
+// continuous adaptation. Used in place of NOISE_FLOOR_STATIC[] when enabled.
+static float adaptedFloor[NUM_BANDS];
+ 
+// ── Raw FFT pass (no windowing, no floor subtraction) ─────────────────────────
+// Used only during fftCalibrate() to measure raw per-bin magnitudes cleanly.
+// Returns the per-band raw average into outRaw[NUM_BANDS].
+static void _fftRawBands(float outRaw[NUM_BANDS]) {
+    // Wait for a fresh audio buffer — spin up to ~200 ms
+    uint32_t deadline = millis() + 200;
+    while (!audioBufferReady && millis() < deadline) {
+        audioUpdate();
+    }
+    if (!audioBufferReady) {
+        // No audio data available; return zeros so calibration can continue
+        for (int b = 0; b < NUM_BANDS; b++) outRaw[b] = 0.0f;
+        return;
+    }
+ 
+    // Copy PCM, apply Hann window
+    for (int i = 0; i < FFT_SIZE; i++) {
+        double w = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFT_SIZE - 1)));
+        vReal[i]  = (double)audioProcessBuffer[i] * w;
+        vImag[i]  = 0.0;
+    }
+    audioBufferReady = false;
+ 
+    FFT.compute(FFT_FORWARD);
+    FFT.complexToMagnitude();
+ 
+    for (int b = 0; b < NUM_BANDS; b++) {
+        double sum = 0.0;
+        int    cnt = 0;
+        for (int k = bandBinStart[b]; k < bandBinEnd[b]; k++) {
+            sum += vReal[k];
+            cnt++;
+        }
+        outRaw[b] = (cnt > 0) ? (float)(sum / cnt) : 0.0f;
+    }
+}
+ 
+// ── Boot-time calibration ──────────────────────────────────────────────────────
+// Called once from setup() (via fftCalibrate() public wrapper below).
+// Collects FFT_CALIBRATE_MS worth of frames, tracks the per-band peak,
+// then seeds adaptedFloor[] = peak × FFT_CALIBRATE_MARGIN.
+//
+// Visual cue: the matrix is NOT yet initialised when this runs (visualizerInit()
+// is called after fftCalibrate() in setup()), so there is nothing to drive here.
+// The ~1 second delay is the implicit cue. If you want an LED indicator, move
+// visualizerInit() before fftCalibrate() and add your own sweep call here.
+static void _runCalibration() {
+    float bootPeak[NUM_BANDS] = {0};
+    uint32_t start = millis();
+ 
+    while (millis() - start < FFT_CALIBRATE_MS) {
+        audioUpdate();
+ 
+        if (audioBufferReady) {
+            float raw[NUM_BANDS];
+            _fftRawBands(raw);   // consumes audioBufferReady internally
+ 
+            for (int b = 0; b < NUM_BANDS; b++) {
+                if (raw[b] > bootPeak[b]) bootPeak[b] = raw[b];
+            }
+        }
+    }
+ 
+    // Seed adaptive floor from the measured boot peak.
+    // Guard: if the room was noisy during calibration, bootPeak can be orders
+    // of magnitude above the static (lab-measured) floor and will blind the
+    // floor for minutes (FALL=0.9997 decays slowly).  Cap the seed at
+    // 4× NOISE_FLOOR_STATIC — enough headroom for a genuinely loud environment
+    // but prevents a single transient during boot from corrupting the floor.
+    for (int b = 0; b < NUM_BANDS; b++) {
+        float measured = bootPeak[b] * FFT_CALIBRATE_MARGIN;
+        float cap      = NOISE_FLOOR_STATIC[b] * 4.0f;
+        measured       = fminf(measured, cap);
+        adaptedFloor[b] = (measured > NOISE_FLOOR_STATIC[b] * 0.5f)
+                            ? measured
+                            : NOISE_FLOOR_STATIC[b];
+    }
+}
+ 
+#endif // FFT_AUTO_CALIBRATE
+ 
+// ─── fftInit ──────────────────────────────────────────────────────────────────
 void fftInit() {
     memset(peakHold, 0, sizeof(peakHold));
+ 
+#if FFT_AUTO_CALIBRATE
+    // Seed adaptive floor with static values; fftCalibrate() will refine them.
+    for (int b = 0; b < NUM_BANDS; b++) {
+        adaptedFloor[b] = NOISE_FLOOR_STATIC[b];
+    }
+#endif
 }
-
+ 
+// ─── fftCalibrate — public API ────────────────────────────────────────────────
+// Call from setup() after audioInit() + fftInit(), before visualizerInit().
+// When FFT_AUTO_CALIBRATE 0 this compiles to an empty inline stub (see fft.h
+// declaration) so the call site in setup() never needs an #if guard.
+void fftCalibrate() {
+#if FFT_AUTO_CALIBRATE
+    _runCalibration();
+#endif
+}
+ 
+// ─── fftProcess — call every loop() when audioBufferReady ─────────────────────
 void fftProcess() {
     if (!audioBufferReady) return;
-
+ 
     // ── 1. Copy int16 PCM into double real buffer, apply Hann window ──────────
     for (int i = 0; i < FFT_SIZE; i++) {
         double window = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFT_SIZE - 1)));
         vReal[i] = (double)audioProcessBuffer[i] * window;
         vImag[i] = 0.0;
     }
-
+ 
     // ── 2. Signal buffer consumed — release double buffer ─────────────────────
     audioBufferReady = false;
-
+ 
     // ── 3. Forward FFT ────────────────────────────────────────────────────────
     FFT.compute(FFT_FORWARD);
     FFT.complexToMagnitude(); // results in vReal[0..FFT_SIZE/2]
-
+ 
     // ── 4. Accumulate bands ───────────────────────────────────────────────────
     for (int b = 0; b < NUM_BANDS; b++) {
         double sum = 0.0;
         int count = 0;
+ 
+#if FFT_AUTO_CALIBRATE
+        // ── Adaptive floor path ───────────────────────────────────────────────
+        // Accumulate raw magnitudes (no pre-filter against the floor — the
+        // floor is subtracted after averaging, not bin-by-bin).
+        for (int k = bandBinStart[b]; k < bandBinEnd[b]; k++) {
+            sum += vReal[k];
+            count++;
+        }
+        float raw = (count > 0) ? (float)(sum / count) : 0.0f;
+        bandRaw[b] = raw;
+
+        // Update adaptive floor with asymmetric IIR.
+        // Rise: per-band coefficient (faster for low-freq bands where EMI pools).
+        // Fall: slow global decay so musical silences don't collapse the floor.
+        if (raw > adaptedFloor[b]) {
+            adaptedFloor[b] = adaptedFloor[b] * FLOOR_RISE_COEFF[b]
+                              + raw * (1.0f - FLOOR_RISE_COEFF[b]);
+        } else {
+            adaptedFloor[b] = adaptedFloor[b] * FFT_FLOOR_FALL_COEFF
+                              + raw * (1.0f - FFT_FLOOR_FALL_COEFF);
+        }
+        // Clamp floor to its measured ambient minimum so it can't collapse to zero.
+        adaptedFloor[b] = fmaxf(adaptedFloor[b], FLOOR_MIN[b]);
+ 
+        // Subtract floor — any signal below the floor is clamped to zero
+        float avg = fmaxf(0.0f, raw - adaptedFloor[b]);
+ 
+#else
+        // ── Static floor path (original behaviour) ────────────────────────────
+        // Only bins above the static floor contribute to the average.
         for (int k = bandBinStart[b]; k < bandBinEnd[b]; k++) {
             double mag = vReal[k];
-            if (mag > NOISE_FLOOR[b]) {
+            if (mag > NOISE_FLOOR_STATIC[b]) {
                 sum += mag;
                 count++;
             }
         }
-        // Subtract noise floor so peakHold tracks only signal, not noise
-        float avg = (count > 0) ? fmaxf(0.0f, (float)(sum / count) - NOISE_FLOOR[b]) : 0.0f;
-
+        float raw_s = (count > 0) ? (float)(sum / count) : 0.0f;
+        bandRaw[b] = raw_s;
+        float avg = fmaxf(0.0f, raw_s - NOISE_FLOOR_STATIC[b]);
+#endif
+ 
         // ── 5. Normalise against decaying peak ────────────────────────────────
         peakHold[b] *= PEAK_DECAY;
         if (avg > peakHold[b]) peakHold[b] = avg;
-
+ 
         float normalised = (peakHold[b] > 0.0f) ? (avg / peakHold[b]) : 0.0f;
-
-        // 6. Apply per-band sensitivity, clamp to 1.0
+ 
+        // ── 6. Apply per-band sensitivity, clamp to 1.0 ───────────────────────
         normalised = fminf(1.0f, normalised * SENSITIVITY[b]);
-
-        // ── 6. Smooth output (IIR low-pass) ───────────────────────────────────
-        bandMagnitude[b] = bandMagnitude[b] * 0.5f + normalised * 0.5f;
+ 
+        // ── 7. Smooth output (per-band IIR low-pass) ─────────────────────────
+        bandMagnitude[b] = bandMagnitude[b] * BAND_SMOOTH[b]
+                         + normalised * (1.0f - BAND_SMOOTH[b]);
     }
 }

@@ -1,4 +1,3 @@
- 
  /* ── Pin map ────────────────────────────────────────────────────────────────
  *
  *   Board   GPIO    Used in          Notes
@@ -92,14 +91,14 @@
  *   • Write to characteristics to control power / mode / brightness
  *   • Subscribe to Status (0004) for live state updates
  */
-
+ 
 #include "audio.h"
 #include "fft.h"
 #include "visualizer.h"
 #include "buttons.h"
 #include "ble.h"
-
-#define DEBUG_SERIAL  0
+ 
+#include "debug.h"   // DEBUG_SERIAL, DEBUG_FFT_BANDS, DEBUG_LIFE
 
 #if DEBUG_SERIAL
   #define DPRINT(x)   do { if (Serial) Serial.print(x);   } while(0)
@@ -108,7 +107,7 @@
   #define DPRINT(x)
   #define DPRINTLN(x)
 #endif
-
+ 
 void setup() {
 #if DEBUG_SERIAL
     Serial.setTxTimeoutMs(0);
@@ -116,25 +115,26 @@ void setup() {
     uint32_t t = millis();
     while (!Serial && (millis() - t) < 1000) {}
 #endif
-
+ 
     if (!audioInit()) {
         DPRINTLN("I2S init failed - check wiring.");
         while (true) delay(1000);
     }
-
+ 
     fftInit();
+    fftCalibrate();    // no-op when FFT_AUTO_CALIBRATE 0 in fft.h
     visualizerInit();
     buttonsInit();
     bleInit();        // starts BLE advertising as "LedMatrix"
-
+ 
     DPRINTLN("Ready. BLE advertising as: " BLE_DEVICE_NAME);
 }
-
+ 
 void loop() {
     // ── Control inputs (buttons + BLE) — always first ────────────────────────
     buttonsUpdate();
     bleUpdate();      // applies pending BLE writes and sends notifications
-
+ 
     // ── Power-off path: keep audio warm, skip render ──────────────────────────
     if (!buttonsPowerOn()) {
         audioUpdate();
@@ -144,24 +144,26 @@ void loop() {
         }
         return;
     }
-
+ 
     // ── Normal render path ────────────────────────────────────────────────────
     audioUpdate();
     if (audioBufferReady) {
         fftProcess();
         visualizerUpdate();
-
+ 
 #if DEBUG_SERIAL
         if (Serial) {
             Serial.print(visualizerModeName(buttonsCurrentMode()));
             Serial.print(" bri="); Serial.print(buttonsBrightness());
             Serial.print(" pwr="); Serial.print(buttonsPowerOn() ? "on" : "off");
+#if DEBUG_FFT_BANDS
             Serial.print("  ");
             for (int b = 0; b < NUM_BANDS; b++) {
                 Serial.print("B"); Serial.print(b); Serial.print("=");
                 Serial.print(bandMagnitude[b] * 100.0f, 1);
-                Serial.print("  ");
+                Serial.print("(raw="); Serial.print(bandRaw[b], 0); Serial.print(")  ");
             }
+#endif
             Serial.println();
         }
 #endif

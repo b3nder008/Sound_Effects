@@ -28,6 +28,7 @@
 #include "visualizer.h"
 #include "fft.h"
 #include "fastled_compat.h"   // CRGB, inoise8, beatsin88, sin16, palettes…
+#include "debug.h"            // DEBUG_SERIAL, DEBUG_LIFE
 
 // ─── NeoMatrix ───────────────────────────────────────────────────────────────
 static Adafruit_NeoMatrix matrix(
@@ -189,8 +190,8 @@ static void renderSpectrum() {
     matrix.fillScreen(0);
 
     for (uint8_t col = 0; col < MATRIX_COLS; col++) {
-        // 1. IIR-smooth bar height
-        float target = bandMagnitude[col] * MATRIX_ROWS;
+        // 1. IIR-smooth bar height — reverse band index so bass (B0) is left, treble right
+        float target = bandMagnitude[(NUM_BANDS - 1) - col] * MATRIX_ROWS;
         if (target < 0.05f * MATRIX_ROWS) target = 0.0f;
         _barHeight[col] += (target - _barHeight[col]) * BAR_SMOOTH;
         float bh = min((float)MATRIX_ROWS, _barHeight[col]);
@@ -205,21 +206,21 @@ static void renderSpectrum() {
         // 3. Full bar rows
         for (uint8_t row = 0; row < fullRows; row++) {
             _ghost[col][row] = fmaxf(_ghost[col][row], 255.0f);
-            matrix.drawPixel(col, DRAW_Y(row), _barColor(row, 255));
+            matrix.drawPixel(col, row, _barColor(row, 255));
         }
 
         // 4. Fractional tip pixel
         if (fullRows < MATRIX_ROWS && frac > 0.01f) {
             uint8_t tipBright = (uint8_t)(frac * 255.0f);
             _ghost[col][fullRows] = fmaxf(_ghost[col][fullRows], (float)tipBright);
-            matrix.drawPixel(col, DRAW_Y(fullRows), _barColor(fullRows, tipBright));
+            matrix.drawPixel(col, fullRows, _barColor(fullRows, tipBright));
         }
 
-        // 5. Ghost trail above bar
+        // 5. Ghost trail below bar tip
         for (uint8_t row = fullRows + 1; row < MATRIX_ROWS; row++) {
             uint8_t gb = (uint8_t)_ghost[col][row];
             if (gb > 4)
-                matrix.drawPixel(col, DRAW_Y(row), _barColor(row, gb));
+                matrix.drawPixel(col, row, _barColor(row, gb));
         }
 
         // 6. Peak dot: latch to rising bar
@@ -240,9 +241,9 @@ static void renderSpectrum() {
         // 8. Peak dot + warm halo
         uint8_t pRow = (uint8_t)_peakPos[col];
         if (pRow < MATRIX_ROWS && _peakPos[col] > 0.5f) {
-            matrix.drawPixel(col, DRAW_Y(pRow), matrix.Color(255, 255, 255));
+            matrix.drawPixel(col, pRow, matrix.Color(255, 255, 255));
             if (pRow > 0)
-                matrix.drawPixel(col, DRAW_Y(pRow - 1),
+                matrix.drawPixel(col, pRow - 1,
                     matrix.Color(PEAK_GLOW_ALPHA, PEAK_GLOW_ALPHA, PEAK_GLOW_ALPHA >> 1));
         }
     }
@@ -780,37 +781,6 @@ static void renderColorWaves() {
 
     matrix.setBrightness(BRIGHTNESS);
     flushLeds(_cwLeds);
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// MODE_RAINBOW / MODE_RAINBOW_GLITTER / MODE_HUE_CYCLE
-// torchv2.ino rainbow(), rainbowWithGlitter(), hueCycle() (exact ports)
-// Beat modulation: extra glitter burst on beat; hue jump for hue cycle.
-// ═════════════════════════════════════════════════════════════════════════════
-
-static CRGB    _simLeds[NUM_LEDS];
-static uint8_t _simGHue = 0;
-
-static void renderSimple() {
-    EVERY_N_MILLISECONDS(20) { _simGHue++; }
-    if (beatFired) _simGHue += 16;
-
-    if (_runtimeMode == MODE_RAINBOW) {
-        fill_rainbow(_simLeds, NUM_LEDS, _simGHue, 1);
-    } else if (_runtimeMode == MODE_RAINBOW_GLITTER) {
-        fill_rainbow(_simLeds, NUM_LEDS, _simGHue, 1);
-        if (random8() < 80 || beatFired)
-            _simLeds[random16(NUM_LEDS)] += CRGB(CRGB::White);
-        if (beatFired)
-            for (int i = 0; i < 5; i++)
-                _simLeds[random16(NUM_LEDS)] += CRGB(CRGB::White);
-    } else { // MODE_HUE_CYCLE
-        uint8_t bri = beatFired ? 255 : 200;
-        fill_solid(_simLeds, NUM_LEDS, hsv2rgb_rainbow(CHSV(_simGHue, 255, bri)));
-    }
-
-    matrix.setBrightness(BRIGHTNESS);
-    flushLeds(_simLeds);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2881,6 +2851,714 @@ static void renderAtom() {
             matrix.drawPixel(x, DRAW_Y(y),
                 matrix.Color(fbR[x][y], fbG[x][y], fbB[x][y]));
 }
+// ═════════════════════════════════════════════════════════════════════════════
+// MODE_LIFE — Conway's Game of Life demo
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ── What this does ───────────────────────────────────────────────────────────
+//
+//   Runs a full Conway's Game of Life simulation on an 8×8 toroidal grid
+//   (edges wrap — left/right and top/bottom connect). Wrapping is essential:
+//   on a finite non-wrapping grid, gliders die at the border in ~8 steps.
+//
+//   The display cycles through five distinct seed categories, each
+//   demonstrating a different class of GoL behavior:
+//
+//     SEED_RANDOM     — pure random fill at ~35 % density.  Chaotic start,
+//                       usually settles into still-lifes and oscillators.
+//     SEED_STILLLIFE  — a curated mix of stable patterns: Block, Beehive,
+//                       Loaf, Boat, Tub — placed randomly on the grid so
+//                       the display is never empty but never changes.
+//     SEED_OSCILLATOR — period-2 and period-3 oscillators: Blinker, Toad,
+//                       Beacon, Pulsar fragment, Pentadecathlon fragment.
+//                       The grid breathes rhythmically.
+//     SEED_SPACESHIP  — Gliders and lightweight spaceships (LWSS) placed at
+//                       varied positions and orientations.  They drift across
+//                       the toroidal grid indefinitely.
+//     SEED_METHUSELAH — R-pentomino and Acorn: tiny seeds that evolve for
+//                       hundreds of generations before stabilising.
+//
+//   After GOL_RESET_MIN..GOL_RESET_MAX seconds (random each cycle) the grid
+//   fades out, advances to the next category, and fades back in. Holding the
+//   mode for a long time therefore cycles through all five classes.
+//
+// ── Color theory ─────────────────────────────────────────────────────────────
+//
+//   Cell age (frames alive since last birth) drives the hue position inside
+//   the active palette:
+//
+//     Age 1  (newborn)   →  palette index 0   — peak energy color
+//     Age 2-4 (young)    →  palette index ~64  — settling
+//     Age 5-12 (mature)  →  palette index ~160 — stable, deep color
+//     Age 13+ (ancient)  →  palette index 220  — cool, faded
+//
+//   This maps directly onto GoL metaphysics:
+//     • Birth  = hot energy = warm/bright hues (reds, yellows, cyans)
+//     • Survival = cooling = the cell "settles into" its environment
+//     • Ancient cells = cold, structural = blues, purples, deep greens
+//
+//   Eight hand-crafted palettes rotate between resets. Each has a thematic
+//   motivation tied to the categories above:
+//
+//     LIFE_PAL_EMBER    — birth=white-hot, old=deep red. Cellular metabolism.
+//     LIFE_PAL_AURORA   — birth=cyan-white, old=deep violet. Arctic lights.
+//     LIFE_PAL_TOXIC    — birth=yellow, old=deep green. Radioactive decay.
+//     LIFE_PAL_COSMOS   — birth=white, old=deep indigo. Stars forming.
+//     LIFE_PAL_MAGMA    — birth=bright orange, old=near-black red. Lava crust.
+//     LIFE_PAL_BIOLUM   — birth=bright teal, old=dark navy. Bioluminescence.
+//     LIFE_PAL_VOID     — birth=magenta, old=black. Dark energy.
+//     LIFE_PAL_SPECTRUM — birth=white, cycles through full hue as cell ages.
+//
+//   A slow hue drift (GOL_HUE_DRIFT_SPEED) rotates all palettes slightly
+//   over time so long-running sessions never feel static.
+//
+// ── Stasis detection ─────────────────────────────────────────────────────────
+//
+//   If the grid reaches a fixed point (no cells change for GOL_STASIS_FRAMES
+//   consecutive generations) it triggers an early reset so the display is
+//   never stuck on a static image. A brief "shiver" flash signals the reset.
+//
+// ── Beat interaction ─────────────────────────────────────────────────────────
+//
+//   beatFired injects a small amount of random noise into the grid: a handful
+//   of cells flip state, temporarily disturbing stable patterns and kicking
+//   off new gliders. This keeps the simulation reactive to music.
+//   beatEnergy modulates the overall brightness (+20 % on hard kicks).
+//
+// ── Timing ───────────────────────────────────────────────────────────────────
+//
+//   GOL_STEP_MS     — milliseconds between simulation steps (default 120 ms
+//                     ≈ ~8 generations/sec — readable on 8×8).
+//   GOL_FADE_FRAMES — length of the cross-fade at resets (in render frames,
+//                     not simulation steps — render runs every loop()).
+//
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── Timing & simulation constants ────────────────────────────────────────────
+#define GOL_STEP_MS        120      // ms between generations
+#define GOL_RESET_MIN      120      // minimum seconds before forced reset
+#define GOL_RESET_MAX      300      // maximum seconds before forced reset
+#define GOL_FADE_FRAMES    40       // render frames for fade-out/in transition
+#define GOL_STASIS_FRAMES  10       // consecutive identical generations → reset
+#define GOL_BEAT_FLIPS     4        // cells to randomly flip on each beat
+#define GOL_HUE_DRIFT_SPEED 1       // palette hue offset increment per reset
+
+// ── Grid ─────────────────────────────────────────────────────────────────────
+#define GOL_W  MATRIX_COLS   // 8
+#define GOL_H  MATRIX_ROWS   // 8
+
+// Cell age: 0 = dead, 1..255 = alive (capped). Age drives color.
+static uint8_t _golAge[GOL_H][GOL_W];      // current generation
+static uint8_t _golNext[GOL_H][GOL_W];     // scratch buffer for next gen
+
+// ── Seed categories ───────────────────────────────────────────────────────────
+#define SEED_RANDOM      0
+#define SEED_STILLLIFE   1
+#define SEED_OSCILLATOR  2
+#define SEED_SPACESHIP   3
+#define SEED_METHUSELAH  4
+#define SEED_COUNT       5
+
+static uint8_t _golSeedType  = 0;
+static uint8_t _golPalIdx    = 0;
+static uint8_t _golHueDrift  = 0;   // global hue offset, incremented each reset
+
+// ── Reset timer ───────────────────────────────────────────────────────────────
+static uint32_t _golResetAt   = 0;   // millis() when next forced reset fires
+static uint8_t  _golStasis    = 0;   // consecutive unchanged-generation counter
+
+// ── Fade state ────────────────────────────────────────────────────────────────
+// States: 0 = running, 1 = fading out, 2 = fading in
+static uint8_t  _golFadeState  = 0;
+static uint8_t  _golFadeFrame  = 0;   // 0..GOL_FADE_FRAMES
+// Snapshot of the grid at fade-out start (drawn at diminishing brightness)
+static uint8_t  _golFadeSnap[GOL_H][GOL_W];
+
+// ── Step timer ────────────────────────────────────────────────────────────────
+static uint32_t _golLastStep   = 0;
+static uint32_t _golGeneration = 0;  // Conway steps since the current seed was applied
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PALETTES
+// Each palette maps cell age (0=newborn, 255=ancient) to a color.
+// Index 0 = youngest (most energetic), index 255 = oldest (most settled).
+// Built as 16-stop CRGBPalette16; ColorFromPalette interpolates.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#define GOL_PAL_COUNT  8
+
+static CRGBPalette16 _golPalettes[GOL_PAL_COUNT];
+
+static void _golBuildPalettes() {
+    // EMBER: white-hot birth → orange → deep crimson (cellular heat death)
+    _golPalettes[0] = CRGBPalette16(
+        CRGB(255,255,220),  CRGB(255,240,80),   CRGB(255,160,20),   CRGB(255,80,0),
+        CRGB(220,40,0),     CRGB(180,10,0),     CRGB(140,0,0),      CRGB(100,0,0),
+        CRGB(80,0,0),       CRGB(60,0,0),       CRGB(40,0,0),       CRGB(28,0,0),
+        CRGB(18,0,0),       CRGB(10,0,0),       CRGB(5,0,0),        CRGB(2,0,0)
+    );
+    // AURORA: cyan-white birth → violet → deep indigo (arctic electromagnetic)
+    _golPalettes[1] = CRGBPalette16(
+        CRGB(220,255,255),  CRGB(100,255,240),  CRGB(0,220,255),    CRGB(0,160,255),
+        CRGB(20,80,255),    CRGB(60,20,220),    CRGB(100,0,200),    CRGB(120,0,180),
+        CRGB(100,0,140),    CRGB(70,0,100),     CRGB(40,0,80),      CRGB(20,0,60),
+        CRGB(10,0,40),      CRGB(5,0,25),       CRGB(2,0,15),       CRGB(0,0,8)
+    );
+    // TOXIC: bright yellow birth → acid green → dark green (radioactive decay)
+    _golPalettes[2] = CRGBPalette16(
+        CRGB(255,255,100),  CRGB(200,255,0),    CRGB(120,230,0),    CRGB(60,200,0),
+        CRGB(20,180,0),     CRGB(0,160,10),     CRGB(0,130,20),     CRGB(0,100,15),
+        CRGB(0,80,10),      CRGB(0,60,5),       CRGB(0,40,0),       CRGB(0,28,0),
+        CRGB(0,18,0),       CRGB(0,10,0),       CRGB(0,5,0),        CRGB(0,2,0)
+    );
+    // COSMOS: white birth → electric blue → deep indigo (stellar formation)
+    _golPalettes[3] = CRGBPalette16(
+        CRGB(255,255,255),  CRGB(180,220,255),  CRGB(80,160,255),   CRGB(20,100,255),
+        CRGB(0,60,220),     CRGB(0,30,180),     CRGB(0,10,140),     CRGB(0,0,120),
+        CRGB(0,0,100),      CRGB(0,0,80),       CRGB(5,0,60),       CRGB(10,0,45),
+        CRGB(8,0,30),       CRGB(5,0,18),       CRGB(2,0,10),       CRGB(1,0,4)
+    );
+    // MAGMA: bright orange birth → dark orange → near-black (cooling lava crust)
+    _golPalettes[4] = CRGBPalette16(
+        CRGB(255,200,50),   CRGB(255,130,0),    CRGB(230,70,0),     CRGB(200,30,0),
+        CRGB(160,10,0),     CRGB(120,5,0),      CRGB(90,2,0),       CRGB(64,0,0),
+        CRGB(48,0,0),       CRGB(34,0,0),       CRGB(22,0,0),       CRGB(14,0,0),
+        CRGB(8,0,0),        CRGB(4,0,0),        CRGB(2,0,0),        CRGB(1,0,0)
+    );
+    // BIOLUM: bright teal birth → cyan → deep navy (deep-sea bioluminescence)
+    _golPalettes[5] = CRGBPalette16(
+        CRGB(200,255,240),  CRGB(0,255,200),    CRGB(0,220,160),    CRGB(0,180,120),
+        CRGB(0,140,100),    CRGB(0,100,80),     CRGB(0,70,70),      CRGB(0,50,60),
+        CRGB(0,30,50),      CRGB(0,20,40),      CRGB(0,12,30),      CRGB(0,6,22),
+        CRGB(0,3,15),       CRGB(0,1,10),       CRGB(0,0,6),        CRGB(0,0,3)
+    );
+    // VOID: bright magenta birth → purple → near-black (dark energy / void)
+    _golPalettes[6] = CRGBPalette16(
+        CRGB(255,180,255),  CRGB(255,60,220),   CRGB(220,0,180),    CRGB(180,0,140),
+        CRGB(140,0,110),    CRGB(110,0,90),     CRGB(80,0,70),      CRGB(60,0,55),
+        CRGB(40,0,40),      CRGB(28,0,28),      CRGB(18,0,18),      CRGB(10,0,12),
+        CRGB(6,0,8),        CRGB(3,0,5),        CRGB(1,0,3),        CRGB(0,0,1)
+    );
+    // SPECTRUM: white birth then full hue wheel as cell ages (purest GoL demo)
+    _golPalettes[7] = CRGBPalette16(
+        CRGB(255,255,255),  CRGB(255,80,0),     CRGB(255,200,0),    CRGB(100,255,0),
+        CRGB(0,255,80),     CRGB(0,255,220),    CRGB(0,160,255),    CRGB(0,40,255),
+        CRGB(80,0,255),     CRGB(180,0,255),    CRGB(255,0,160),    CRGB(255,0,60),
+        CRGB(200,0,0),      CRGB(120,0,0),      CRGB(50,0,0),       CRGB(10,0,0)
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SEED PATTERNS
+// All coordinates are (col, row) = (x, y), placed with wrapping so patterns
+// near the edge appear on the other side.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Helper: set a cell alive (age=1), coordinates wrap toroidally
+static inline void _golSet(uint8_t x, uint8_t y) {
+    _golAge[y % GOL_H][x % GOL_W] = 1;
+}
+
+// Helper: place a pattern given as (dx,dy) offsets from origin (ox,oy)
+static void _golPlace(uint8_t ox, uint8_t oy,
+                      const int8_t* pts, uint8_t npts) {
+    for (uint8_t i = 0; i < npts; i++) {
+        int8_t dx = pts[i * 2];
+        int8_t dy = pts[i * 2 + 1];
+        _golSet((uint8_t)((ox + dx + GOL_W * 4) % GOL_W),
+                (uint8_t)((oy + dy + GOL_H * 4) % GOL_H));
+    }
+}
+
+// ── Still life patterns ───────────────────────────────────────────────────────
+// Block (2×2): simplest stable object
+static const int8_t _golBlock[]    = { 0,0, 1,0, 0,1, 1,1 };
+// Beehive (6 cells): most common naturally-occurring still life
+static const int8_t _golBeehive[]  = { 1,0, 2,0, 0,1, 3,1, 1,2, 2,2 };
+// Loaf (7 cells)
+static const int8_t _golLoaf[]     = { 1,0, 2,0, 0,1, 3,1, 1,2, 3,2, 2,3 };
+// Boat (5 cells)
+static const int8_t _golBoat[]     = { 0,0, 1,0, 0,1, 2,1, 1,2 };
+// Tub (4 cells) — diamond
+static const int8_t _golTub[]      = { 1,0, 0,1, 2,1, 1,2 };
+
+// ── Oscillator patterns ───────────────────────────────────────────────────────
+// Blinker (period 2): three cells in a row
+static const int8_t _golBlinker[]  = { 0,0, 1,0, 2,0 };
+// Toad (period 2): two offset rows of 3
+static const int8_t _golToad[]     = { 1,0, 2,0, 3,0, 0,1, 1,1, 2,1 };
+// Beacon (period 2): two touching blocks
+static const int8_t _golBeacon[]   = { 0,0, 1,0, 0,1, 3,2, 2,3, 3,3 };
+// Pulsar fragment (period 3): place the top arm; the rest builds from symmetry
+// Full pulsar is 13×13 — too big. This is a compact 3-period trigger cluster.
+static const int8_t _golClock[]    = { 1,0, 0,1, 1,1, 2,1, 1,2 }; // period 2 "clock" cross
+
+// ── Spaceship patterns ────────────────────────────────────────────────────────
+// Glider (period 4, moves diagonally)
+static const int8_t _golGlider[]   = { 1,0, 2,1, 0,2, 1,2, 2,2 };
+// Glider variant — mirrored (moves opposite diagonal)
+static const int8_t _golGliderM[]  = { 1,0, 0,1, 2,1, 1,2, 2,2 };  // reflected
+// Glider variant — flipped vertically
+static const int8_t _golGliderV[]  = { 0,0, 1,0, 2,0, 0,1, 1,2 };
+// Lightweight Spaceship / LWSS (period 4, moves horizontally)
+static const int8_t _golLWSS[]     = { 1,0, 4,0, 0,1, 0,2, 4,2, 0,3, 1,3, 2,3, 3,3 };
+
+// ── Methuselah patterns ───────────────────────────────────────────────────────
+// R-pentomino: 5 cells, evolves for 1103 generations before stabilising
+static const int8_t _golRPento[]   = { 1,0, 2,0, 0,1, 1,1, 1,2 };
+// Acorn: 7 cells, evolves for 5206 generations
+static const int8_t _golAcorn[]    = { 1,0, 3,1, 0,2, 1,2, 4,2, 5,2, 6,2 };
+// Pi-heptomino: chaotic methuselah
+static const int8_t _golPiHept[]   = { 0,0, 1,0, 2,0, 0,1, 2,1, 0,2, 1,2, 2,2 };
+
+// ── Seed initialisation functions ─────────────────────────────────────────────
+
+static void _golSeedRandom() {
+    // ~35 % density — higher gives early death, lower gives sparse start
+    for (uint8_t y = 0; y < GOL_H; y++)
+        for (uint8_t x = 0; x < GOL_W; x++)
+            _golAge[y][x] = (random8(100) < 35) ? 1 : 0;
+}
+
+static void _golSeedStillLife() {
+    memset(_golAge, 0, sizeof(_golAge));
+    // Place 2-3 non-overlapping still-life patterns at random positions
+    uint8_t count = 2 + random8(2);  // 2 or 3
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t ox = random8(GOL_W);
+        uint8_t oy = random8(GOL_H);
+        uint8_t which = random8(5);
+        switch (which) {
+            case 0: _golPlace(ox, oy, _golBlock,   4); break;
+            case 1: _golPlace(ox, oy, _golBeehive, 6); break;
+            case 2: _golPlace(ox, oy, _golLoaf,    7); break;
+            case 3: _golPlace(ox, oy, _golBoat,    5); break;
+            case 4: _golPlace(ox, oy, _golTub,     4); break;
+        }
+    }
+}
+
+static void _golSeedOscillator() {
+    memset(_golAge, 0, sizeof(_golAge));
+    // Place 2-4 oscillators
+    uint8_t count = 2 + random8(3);
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t ox = random8(GOL_W);
+        uint8_t oy = random8(GOL_H);
+        uint8_t which = random8(4);
+        switch (which) {
+            case 0: _golPlace(ox, oy, _golBlinker, 3); break;
+            case 1: _golPlace(ox, oy, _golToad,    6); break;
+            case 2: _golPlace(ox, oy, _golBeacon,  6); break;
+            case 3: _golPlace(ox, oy, _golClock,   5); break;
+        }
+    }
+}
+
+static void _golSeedSpaceship() {
+    memset(_golAge, 0, sizeof(_golAge));
+    // 2-4 gliders/spaceships at varied positions and orientations
+    uint8_t count = 2 + random8(3);
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t ox = random8(GOL_W);
+        uint8_t oy = random8(GOL_H);
+        uint8_t which = random8(4);
+        switch (which) {
+            case 0: _golPlace(ox, oy, _golGlider,  5); break;
+            case 1: _golPlace(ox, oy, _golGliderM, 5); break;
+            case 2: _golPlace(ox, oy, _golGliderV, 5); break;
+            // LWSS fits on 8-wide toroidal grid — place near top half
+            case 3: _golPlace(ox % 4, oy, _golLWSS, 9); break;
+        }
+    }
+}
+
+static void _golSeedMethuselah() {
+    memset(_golAge, 0, sizeof(_golAge));
+    // Single methuselah near center — let it fill the grid organically
+    uint8_t ox = 2 + random8(4);
+    uint8_t oy = 2 + random8(4);
+    uint8_t which = random8(3);
+    switch (which) {
+        case 0: _golPlace(ox, oy, _golRPento,  5); break;
+        case 1: _golPlace(ox, oy, _golAcorn,   7); break;
+        case 2: _golPlace(ox, oy, _golPiHept,  8); break;
+    }
+}
+
+// Master seed dispatch
+static void _golApplySeed(uint8_t seedType) {
+    switch (seedType) {
+        case SEED_RANDOM:      _golSeedRandom();      break;
+        case SEED_STILLLIFE:   _golSeedStillLife();   break;
+        case SEED_OSCILLATOR:  _golSeedOscillator();  break;
+        case SEED_SPACESHIP:   _golSeedSpaceship();   break;
+        case SEED_METHUSELAH:  _golSeedMethuselah();  break;
+        default:               _golSeedRandom();      break;
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SIMULATION STEP
+// Standard Moore-neighbourhood rules on a toroidal grid:
+//   Birth:    dead cell with exactly 3 neighbours → alive
+//   Survival: live cell with 2 or 3 neighbours   → survives (age++)
+//   Death:    all other live cells                → die
+// ═════════════════════════════════════════════════════════════════════════════
+
+static uint8_t _golCountNeighbours(uint8_t x, uint8_t y) {
+    uint8_t n = 0;
+    for (int8_t dy = -1; dy <= 1; dy++) {
+        for (int8_t dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            uint8_t nx = (uint8_t)((x + dx + GOL_W) % GOL_W);
+            uint8_t ny = (uint8_t)((y + dy + GOL_H) % GOL_H);
+            if (_golAge[ny][nx] > 0) n++;
+        }
+    }
+    return n;
+}
+
+// ── Debug helpers (compiled out when DEBUG_SERIAL or DEBUG_LIFE is 0) ─────────
+#if DEBUG_SERIAL && DEBUG_LIFE
+
+static const char* const _golSeedNames[SEED_COUNT] = {
+    "RANDOM", "STILLLIFE", "OSCILLATOR", "SPACESHIP", "METHUSELAH"
+};
+static const char* const _golPalNames[GOL_PAL_COUNT] = {
+    "EMBER", "AURORA", "TOXIC", "COSMOS", "MAGMA", "BIOLUM", "VOID", "SPECTRUM"
+};
+
+// Count live cells on the current grid (max 64).
+static uint8_t _golCountCells() {
+    uint8_t n = 0;
+    for (uint8_t y = 0; y < GOL_H; y++)
+        for (uint8_t x = 0; x < GOL_W; x++)
+            if (_golAge[y][x] > 0) n++;
+    return n;
+}
+
+// Print the 8×8 grid as ASCII art.
+//   '#' = live cell (any age)   '.' = dead cell
+// Row 0 is the top of the simulation coordinate space, which corresponds to
+// the BOTTOM of the physical matrix (DRAW_Y inverts Y before drawPixel).
+static void _golPrintGrid() {
+    for (uint8_t y = 0; y < GOL_H; y++) {
+        if (Serial) {
+            Serial.print(F("[GoL]   "));
+            for (uint8_t x = 0; x < GOL_W; x++)
+                Serial.print(_golAge[y][x] > 0 ? '#' : '.');
+            Serial.println();
+        }
+    }
+}
+
+#endif // DEBUG_SERIAL && DEBUG_LIFE
+
+// Returns true if anything changed (stasis detection)
+static bool _golStep() {
+    bool changed = false;
+    for (uint8_t y = 0; y < GOL_H; y++) {
+        for (uint8_t x = 0; x < GOL_W; x++) {
+            uint8_t neighbours = _golCountNeighbours(x, y);
+            bool    alive      = (_golAge[y][x] > 0);
+
+            if (alive && (neighbours == 2 || neighbours == 3)) {
+                // Survival: increment age, cap at 255
+                _golNext[y][x] = (_golAge[y][x] < 255) ? _golAge[y][x] + 1 : 255;
+                if (_golNext[y][x] != _golAge[y][x]) changed = true;
+            } else if (!alive && neighbours == 3) {
+                // Birth
+                _golNext[y][x] = 1;
+                changed = true;
+            } else {
+                // Death (or remains dead)
+                if (_golAge[y][x] > 0) changed = true;
+                _golNext[y][x] = 0;
+            }
+        }
+    }
+    memcpy(_golAge, _golNext, sizeof(_golAge));
+    return changed;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COLOR MAPPING
+// age=1 → palette index 0 (youngest/hottest)
+// age→∞ → palette index 255 (oldest/coolest), asymptotically
+// A logarithmic curve keeps young cells bright for longer — important on 8×8
+// where cells rarely survive more than ~30 generations anyway.
+// ═════════════════════════════════════════════════════════════════════════════
+
+static CRGB _golAgeToColor(uint8_t age, uint8_t palIdx, uint8_t hueDrift) {
+    if (age == 0) return CRGB(0, 0, 0);
+
+    // Map age 1..255 → palette index 0..255 logarithmically.
+    // age=1  → idx≈0    (newborn, hottest color)
+    // age=8  → idx≈100
+    // age=20 → idx≈180
+    // age=60 → idx≈230
+    // Use integer approximation: idx = 255 * log2(age) / log2(255) ≈ 255*log2(age)/8
+    // Faster: use a lookup-free formula: idx = min(255, (age * 48) >> 3) for small ages
+    // then clamp. Tuned so age 1 = 0, age 32 ≈ 192, age 60+ = 240+.
+    uint16_t idx16;
+    if (age < 4)        idx16 = (uint16_t)age * 20;        // 0..80
+    else if (age < 16)  idx16 = 80 + (uint16_t)(age-4) * 8; // 80..176
+    else if (age < 40)  idx16 = 176 + (uint16_t)(age-16) * 3; // 176..248
+    else                idx16 = 248;
+    uint8_t idx = (uint8_t)(idx16 > 255 ? 255 : idx16);
+
+    // Apply hue drift as a rotation around the palette
+    idx = (uint8_t)((idx + hueDrift) & 0xFF);
+
+    return ColorFromPalette(_golPalettes[palIdx], idx, 255, LINEARBLEND);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INIT
+// ═════════════════════════════════════════════════════════════════════════════
+
+static void _golInit() {
+    _golBuildPalettes();
+    memset(_golAge,  0, sizeof(_golAge));
+    memset(_golNext, 0, sizeof(_golNext));
+
+    _golSeedType   = 0;
+    _golPalIdx     = 0;
+    _golHueDrift   = 0;
+    _golStasis     = 0;
+    _golFadeState  = 0;
+    _golFadeFrame  = 0;
+    _golLastStep   = millis();
+    _golGeneration = 0;
+
+    // Randomise first reset time: GOL_RESET_MIN..GOL_RESET_MAX seconds
+    _golResetAt = millis() + (uint32_t)(GOL_RESET_MIN + random8(GOL_RESET_MAX - GOL_RESET_MIN)) * 1000UL;
+
+    _golApplySeed(_golSeedType);
+
+#if DEBUG_SERIAL && DEBUG_LIFE
+    if (Serial) {
+        Serial.println(F("[GoL] ══ MODE_LIFE initialised ════════════════════════════"));
+        Serial.print(F("[GoL]   seed  : ")); Serial.println(_golSeedNames[_golSeedType]);
+        Serial.print(F("[GoL]   pal   : ")); Serial.println(_golPalNames[_golPalIdx]);
+        Serial.print(F("[GoL]   step  : ")); Serial.print(GOL_STEP_MS); Serial.println(F(" ms / generation"));
+        Serial.print(F("[GoL]   reset : ")); Serial.print(GOL_RESET_MIN); Serial.print('-');
+                                             Serial.print(GOL_RESET_MAX); Serial.println(F(" s (random)"));
+        Serial.print(F("[GoL]   stasis: ")); Serial.print(GOL_STASIS_FRAMES); Serial.println(F(" frozen gens → reset"));
+        Serial.print(F("[GoL]   beat  : flips ")); Serial.print(GOL_BEAT_FLIPS); Serial.println(F(" random cells"));
+        _golPrintGrid();
+    }
+#endif
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RENDER
+// ═════════════════════════════════════════════════════════════════════════════
+
+static void renderLife() {
+    matrix.setBrightness((uint8_t)fminf(255.0f, BRIGHTNESS * (1.0f + beatEnergy * 0.20f)));
+    matrix.fillScreen(0);
+
+    uint32_t now = millis();
+
+    // ── Fade-out phase ────────────────────────────────────────────────────────
+    if (_golFadeState == 1) {
+        _golFadeFrame++;
+        float t = (float)_golFadeFrame / GOL_FADE_FRAMES;  // 0→1
+        // Ease-out: slower at start so the existing pattern is readable, fast at end
+        float alpha = (1.0f - t) * (1.0f - t);
+        uint8_t a8 = (uint8_t)(alpha * 255.0f);
+
+        for (uint8_t y = 0; y < GOL_H; y++) {
+            for (uint8_t x = 0; x < GOL_W; x++) {
+                uint8_t age = _golFadeSnap[y][x];
+                if (age == 0) continue;
+                CRGB c = _golAgeToColor(age, _golPalIdx, _golHueDrift);
+                c.r = scale8(c.r, a8);
+                c.g = scale8(c.g, a8);
+                c.b = scale8(c.b, a8);
+                matrix.drawPixel(x, DRAW_Y(y), matrix.Color(c.r, c.g, c.b));
+            }
+        }
+
+        if (_golFadeFrame >= GOL_FADE_FRAMES) {
+            // Cross-fade done — apply the new seed and start fade-in
+            _golSeedType = (_golSeedType + 1) % SEED_COUNT;
+            _golPalIdx   = (_golPalIdx   + 1) % GOL_PAL_COUNT;
+            _golHueDrift = (_golHueDrift + GOL_HUE_DRIFT_SPEED) & 0xFF;
+            _golStasis   = 0;
+            _golGeneration = 0;
+            _golApplySeed(_golSeedType);
+#if DEBUG_SERIAL && DEBUG_LIFE
+            if (Serial) {
+                // Printed once per reset cycle when the old grid has fully
+                // faded out and the new seed pattern has just been written
+                // into _golAge[]. The fade-in animation will now bring it in.
+                Serial.println(F("[GoL] ── fade-out done: new seed written ─────────────────────"));
+                Serial.print(F("[GoL]   seed  : ")); Serial.println(_golSeedNames[_golSeedType]);
+                Serial.print(F("[GoL]   pal   : ")); Serial.println(_golPalNames[_golPalIdx]);
+                Serial.print(F("[GoL]   cells : ")); Serial.print(_golCountCells()); Serial.println(F(" live at gen 0"));
+                _golPrintGrid();
+            }
+#endif
+            _golResetAt = now + (uint32_t)(GOL_RESET_MIN + random8(GOL_RESET_MAX - GOL_RESET_MIN)) * 1000UL;
+            _golFadeState = 2;
+            _golFadeFrame = 0;
+        }
+        return;
+    }
+
+    // ── Fade-in phase ─────────────────────────────────────────────────────────
+    if (_golFadeState == 2) {
+        _golFadeFrame++;
+        float t     = (float)_golFadeFrame / GOL_FADE_FRAMES;
+        // Ease-in: slow start so the new pattern "materialises" gently
+        float alpha = t * t;
+        uint8_t a8  = (uint8_t)(alpha * 255.0f);
+
+        for (uint8_t y = 0; y < GOL_H; y++) {
+            for (uint8_t x = 0; x < GOL_W; x++) {
+                uint8_t age = _golAge[y][x];
+                if (age == 0) continue;
+                CRGB c = _golAgeToColor(age, _golPalIdx, _golHueDrift);
+                c.r = scale8(c.r, a8);
+                c.g = scale8(c.g, a8);
+                c.b = scale8(c.b, a8);
+                matrix.drawPixel(x, DRAW_Y(y), matrix.Color(c.r, c.g, c.b));
+            }
+        }
+
+        if (_golFadeFrame >= GOL_FADE_FRAMES) {
+            _golFadeState = 0;  // running
+            _golFadeFrame = 0;
+            _golLastStep  = now;
+#if DEBUG_SERIAL && DEBUG_LIFE
+            if (Serial) {
+                // Fade-in animation is complete. The simulation is now fully
+                // visible and stepping normally. Generation counter is 0 here
+                // because _golGeneration was reset when the seed was applied.
+                Serial.println(F("[GoL] ── fade-in done: simulation running ────────────────────"));
+                Serial.print(F("[GoL]   seed  : ")); Serial.println(_golSeedNames[_golSeedType]);
+                Serial.print(F("[GoL]   pal   : ")); Serial.println(_golPalNames[_golPalIdx]);
+                Serial.print(F("[GoL]   cells : ")); Serial.print(_golCountCells()); Serial.println(F(" live"));
+            }
+#endif
+        }
+        return;
+    }
+
+    // ── Normal running phase ──────────────────────────────────────────────────
+
+    // Beat: randomly flip GOL_BEAT_FLIPS cells to inject chaos
+    if (beatFired) {
+#if DEBUG_SERIAL && DEBUG_LIFE
+        // Printed once per detected beat. Lists the (col, row) of every cell
+        // that was toggled. "alive→dead" means the cell was live and is now
+        // killed; "dead→alive" means it was empty and is now spawned at age 1.
+        // This shows exactly which cells received the beat injection.
+        if (Serial) {
+            Serial.print(F("[GoL] beat @ gen=")); Serial.print(_golGeneration);
+            Serial.print(F("  flipping ")); Serial.print(GOL_BEAT_FLIPS); Serial.println(F(" cells:"));
+        }
+#endif
+        for (uint8_t i = 0; i < GOL_BEAT_FLIPS; i++) {
+            uint8_t bx = random8(GOL_W);
+            uint8_t by = random8(GOL_H);
+            bool wasAlive = (_golAge[by][bx] > 0);
+            // Toggle: dead→alive, alive→dead
+            _golAge[by][bx] = wasAlive ? 0 : 1;
+#if DEBUG_SERIAL && DEBUG_LIFE
+            if (Serial) {
+                Serial.print(F("[GoL]   col=")); Serial.print(bx);
+                Serial.print(F(" row=")); Serial.print(by);
+                Serial.println(wasAlive ? F("  alive→dead") : F("  dead→alive"));
+            }
+#endif
+        }
+    }
+
+    // Advance simulation every GOL_STEP_MS
+    if ((uint32_t)(now - _golLastStep) >= GOL_STEP_MS) {
+        bool changed = _golStep();
+        _golLastStep = now;
+        _golGeneration++;
+
+        if (!changed) {
+            _golStasis++;
+            if (_golStasis >= GOL_STASIS_FRAMES) {
+#if DEBUG_SERIAL && DEBUG_LIFE
+                if (Serial) {
+                    // The grid has produced the same pattern for GOL_STASIS_FRAMES
+                    // consecutive generations. This means it reached a fixed point
+                    // (still life) or a cycle that _golStep() can't detect as changed.
+                    // A fade-out/seed-change reset will now begin.
+                    Serial.print(F("[GoL] STASIS at gen=")); Serial.print(_golGeneration);
+                    Serial.print(F("  (")); Serial.print(GOL_STASIS_FRAMES);
+                    Serial.println(F(" frozen gens) → triggering fade-out"));
+                }
+#endif
+                // Grid is frozen — trigger reset
+                memcpy(_golFadeSnap, _golAge, sizeof(_golAge));
+                _golFadeState = 1;
+                _golFadeFrame = 0;
+                _golStasis    = 0;
+            }
+        } else {
+            _golStasis = 0;
+        }
+
+#if DEBUG_SERIAL && DEBUG_LIFE
+        if (Serial) {
+            // Printed every simulation step (every GOL_STEP_MS milliseconds).
+            // gen    = Conway generations since the current seed was applied.
+            // seed   = active seed category (what initial pattern was loaded).
+            // pal    = active colour palette name.
+            // cells  = number of live cells on the 8×8 grid (0–64).
+            // stasis = consecutive unchanged generations / threshold.
+            //          When stasis reaches the threshold a reset is triggered.
+            // The ASCII grid follows: '#' = live cell, '.' = dead cell.
+            // Row 0 of the grid = bottom row of the physical matrix (DRAW_Y).
+            Serial.print(F("[GoL] gen=")); Serial.print(_golGeneration);
+            Serial.print(F("  seed=")); Serial.print(_golSeedNames[_golSeedType]);
+            Serial.print(F("  pal=")); Serial.print(_golPalNames[_golPalIdx]);
+            Serial.print(F("  cells=")); Serial.print(_golCountCells());
+            Serial.print(F("  stasis=")); Serial.print(_golStasis);
+            Serial.print(F("/")); Serial.println(GOL_STASIS_FRAMES);
+            _golPrintGrid();
+        }
+#endif
+    }
+
+    // Check forced reset timer
+    if (_golFadeState == 0 && (int32_t)(now - _golResetAt) >= 0) {
+#if DEBUG_SERIAL && DEBUG_LIFE
+        if (Serial) {
+            // The scheduled wall-clock reset timer fired. This happens every
+            // GOL_RESET_MIN..GOL_RESET_MAX seconds regardless of stasis, so
+            // even a healthy, changing grid will eventually cycle to a new seed.
+            // gen= shows how many steps ran during this seed's lifetime.
+            Serial.print(F("[GoL] TIMEOUT at gen=")); Serial.print(_golGeneration);
+            Serial.print(F("  cells=")); Serial.print(_golCountCells());
+            Serial.println(F("  → scheduled fade-out"));
+        }
+#endif
+        memcpy(_golFadeSnap, _golAge, sizeof(_golAge));
+        _golFadeState = 1;
+        _golFadeFrame = 0;
+        _golStasis    = 0;
+    }
+
+    // Draw current grid
+    for (uint8_t y = 0; y < GOL_H; y++) {
+        for (uint8_t x = 0; x < GOL_W; x++) {
+            uint8_t age = _golAge[y][x];
+            if (age == 0) continue;
+            CRGB c = _golAgeToColor(age, _golPalIdx, _golHueDrift);
+            matrix.drawPixel(x, DRAW_Y(y), matrix.Color(c.r, c.g, c.b));
+        }
+    }
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Init + Update — always compiled
@@ -2925,6 +3603,7 @@ void visualizerInit() {
     _wispInit();
     _pcbaInit();
     _atomInit();
+    _golInit();
 }
 
 // ── Runtime mode state (variable declared near top of file) ─────────────────
@@ -2959,6 +3638,7 @@ void visualizerSetMode(uint8_t mode) {
     if (mode == MODE_WISP)      _wispInit();
     if (mode == MODE_PCBA)      _pcbaInit();
     if (mode == MODE_ATOM)      _atomInit();
+    if (mode == MODE_LIFE)      _golInit();
     matrix.fillScreen(0);
     matrix.show();
 }
@@ -2988,9 +3668,6 @@ void visualizerUpdate() {
         case MODE_SINELON:              renderSinelon();    break;
         case MODE_PRIDE:                renderPride();      break;
         case MODE_COLOR_WAVES:          renderColorWaves(); break;
-        case MODE_RAINBOW:
-        case MODE_RAINBOW_GLITTER:
-        case MODE_HUE_CYCLE:            renderSimple();     break;
         case MODE_CLOUD_TWINKLES:
         case MODE_RAINBOW_TWINKLES:     renderTwinkles();   break;
         case MODE_RAIN:                 renderRain();       break;
@@ -3000,6 +3677,7 @@ void visualizerUpdate() {
         case MODE_WISP:                 renderWisp();       break;
         case MODE_PCBA:                 renderPcba();       break;
         case MODE_ATOM:                 renderAtom();       break;
+        case MODE_LIFE:                 renderLife();       break;
         default:                        renderSpectrum();   break;
     }
 
