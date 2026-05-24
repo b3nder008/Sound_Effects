@@ -2935,7 +2935,7 @@ static void renderAtom() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ── Timing & simulation constants ────────────────────────────────────────────
-#define GOL_STEP_MS        120      // ms between generations
+#define GOL_STEP_MS        240      // ms between generations (halved from original 120)
 #define GOL_RESET_MIN      120      // minimum seconds before forced reset
 #define GOL_RESET_MAX      300      // maximum seconds before forced reset
 #define GOL_FADE_FRAMES    40       // render frames for fade-out/in transition
@@ -2957,7 +2957,8 @@ static uint8_t _golNext[GOL_H][GOL_W];     // scratch buffer for next gen
 #define SEED_OSCILLATOR  2
 #define SEED_SPACESHIP   3
 #define SEED_METHUSELAH  4
-#define SEED_COUNT       5
+#define SEED_LENIA       5   // multi-kernel continuous cellular automaton
+#define SEED_COUNT       6
 
 static uint8_t _golSeedType  = 0;
 static uint8_t _golPalIdx    = 0;
@@ -2976,7 +2977,38 @@ static uint8_t  _golFadeSnap[GOL_H][GOL_W];
 
 // ── Step timer ────────────────────────────────────────────────────────────────
 static uint32_t _golLastStep   = 0;
-static uint32_t _golGeneration = 0;  // Conway steps since the current seed was applied
+static uint32_t _golGeneration = 0;  // simulation steps since current seed was applied
+
+// ── Period-2 oscillation detector ────────────────────────────────────────────
+// Blinkers, toads, and beacons cycle continuously so changed=true every step
+// and the stasis counter never fires. We detect this by comparing the current
+// grid to the grid 2 steps ago: if they match for GOL_OSC_RESET_N consecutive
+// steps the pattern is stuck and a forced fade-out reset fires (~30 s).
+static uint8_t _golSnap1Ago[GOL_H][GOL_W];  // grid 1 step ago
+static uint8_t _golSnap2Ago[GOL_H][GOL_W];  // grid 2 steps ago
+static uint8_t _golOscCount = 0;
+// 125 steps × 240 ms/step = 30 000 ms = 30 s
+#define GOL_OSC_RESET_N  125
+
+// ── Lenia continuous field ─────────────────────────────────────────────────────
+// Active when _golSeedType == SEED_LENIA.
+// _lenField[y][x] ∈ [0.0, 1.0] holds the continuous activation level.
+// After each Lenia step, _golAge[][] is recomputed from _lenField so the
+// existing colour mapper, fade, and draw code works without modification.
+static float _lenField[GOL_H][GOL_W];   // current continuous field
+static float _lenNext[GOL_H][GOL_W];    // Euler scratch buffer
+
+// Precomputed kernel tables [ky+3][kx+3] covering offsets dx,dy ∈ [−3,+3].
+// Built once in _lenBuildKernels() at mode init.
+static float _lenK1[7][7];   // inner-ring kernel  (R≈2.0)
+static float _lenK2[7][7];   // outer-ring kernel  (R≈3.5)
+static float _lenK1sum;      // normalisation denominators
+static float _lenK2sum;
+
+// ms between Lenia steps — faster than GoL (8 gens/s vs ~12 steps/s @ 80ms)
+#define LEN_STEP_MS   60
+// Field threshold below which a cell renders as dark (age = 0)
+#define LEN_ALIVE_THR 0.04f
 
 // ═════════════════════════════════════════════════════════════════════════════
 // PALETTES
@@ -3046,6 +3078,56 @@ static void _golBuildPalettes() {
         CRGB(80,0,255),     CRGB(180,0,255),    CRGB(255,0,160),    CRGB(255,0,60),
         CRGB(200,0,0),      CRGB(120,0,0),      CRGB(50,0,0),       CRGB(10,0,0)
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LENIA KERNEL PRECOMPUTATION
+//
+// Two annular ("ring") kernels. Each kernel weight at offset (dx, dy) is:
+//
+//   K(dx,dy) = exp(–((r/R – mu_K)²) / (2·sigma_K²))   for r/R ≤ 1
+//            = 0                                        otherwise
+//
+//   where r = sqrt(dx²+dy²) is Euclidean distance to the neighbour cell.
+//
+// K1  (inner ring, R=2.0):  peaks at r ≈ 1.0 — weights nearest neighbours.
+// K2  (outer ring, R=3.5):  peaks at r ≈ 1.75 — reaches across the 8×8 grid.
+//
+// The centre cell (0,0) is always excluded (self does not contribute to u).
+// Normalisation sums (_lenK1sum, _lenK2sum) are stored for use in _lenStep().
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void _lenBuildKernels() {
+    const float R1 = 2.0f,  muK1 = 0.50f, sgK1 = 0.15f;
+    const float R2 = 3.5f,  muK2 = 0.50f, sgK2 = 0.15f;
+
+    _lenK1sum = 0.0f;
+    _lenK2sum = 0.0f;
+
+    for (int dy = -3; dy <= 3; dy++) {
+        for (int dx = -3; dx <= 3; dx++) {
+            if (dx == 0 && dy == 0) {
+                _lenK1[dy + 3][dx + 3] = 0.0f;
+                _lenK2[dy + 3][dx + 3] = 0.0f;
+                continue;
+            }
+            float r  = sqrtf((float)(dx * dx + dy * dy));
+
+            float r1n = r / R1;
+            float v1  = (r1n <= 1.0f)
+                      ? expf(-((r1n - muK1) * (r1n - muK1)) / (2.0f * sgK1 * sgK1))
+                      : 0.0f;
+            _lenK1[dy + 3][dx + 3] = v1;
+            _lenK1sum += v1;
+
+            float r2n = r / R2;
+            float v2  = (r2n <= 1.0f)
+                      ? expf(-((r2n - muK2) * (r2n - muK2)) / (2.0f * sgK2 * sgK2))
+                      : 0.0f;
+            _lenK2[dy + 3][dx + 3] = v2;
+            _lenK2sum += v2;
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3186,6 +3268,40 @@ static void _golSeedMethuselah() {
     }
 }
 
+// ── Lenia seed: smooth Gaussian blobs ─────────────────────────────────────────
+// Places 2–4 overlapping blobs with random positions, amplitudes, and spreads.
+// The continuous field is then quantised into _golAge using an inverted mapping
+// so high activation (≈1.0) maps to a low age value (hot palette colour) and
+// low activation maps to a high age value (cool palette colour).
+static void _golSeedLenia() {
+    memset(_lenField, 0, sizeof(_lenField));
+    uint8_t nblobs = 2 + random8(3);          // 2..4 blobs per seed
+    for (uint8_t b = 0; b < nblobs; b++) {
+        float cx  = (float)random8(GOL_W);
+        float cy  = (float)random8(GOL_H);
+        float amp = 0.40f + random8(6) * 0.10f;  // 0.40..0.90
+        float sp2 = 2.00f + random8(20) * 0.15f; // spread² → blob radius
+        for (uint8_t y = 0; y < GOL_H; y++) {
+            for (uint8_t x = 0; x < GOL_W; x++) {
+                float ddx = fabsf((float)x - cx);
+                if (ddx > GOL_W * 0.5f) ddx = GOL_W - ddx;  // toroidal wrap
+                float ddy = fabsf((float)y - cy);
+                if (ddy > GOL_H * 0.5f) ddy = GOL_H - ddy;
+                float v = _lenField[y][x] + amp * expf(-(ddx * ddx + ddy * ddy) / sp2);
+                _lenField[y][x] = fminf(1.0f, v);
+            }
+        }
+    }
+    // Quantise: high field (active) → low age (hot), low field → high age (cool)
+    for (uint8_t y = 0; y < GOL_H; y++)
+        for (uint8_t x = 0; x < GOL_W; x++) {
+            float v = _lenField[y][x];
+            _golAge[y][x] = (v > LEN_ALIVE_THR)
+                          ? (uint8_t)fmaxf(1.0f, (1.0f - v) * 250.0f)
+                          : 0;
+        }
+}
+
 // Master seed dispatch
 static void _golApplySeed(uint8_t seedType) {
     switch (seedType) {
@@ -3194,6 +3310,7 @@ static void _golApplySeed(uint8_t seedType) {
         case SEED_OSCILLATOR:  _golSeedOscillator();  break;
         case SEED_SPACESHIP:   _golSeedSpaceship();   break;
         case SEED_METHUSELAH:  _golSeedMethuselah();  break;
+        case SEED_LENIA:       _golSeedLenia();       break;
         default:               _golSeedRandom();      break;
     }
 }
@@ -3223,7 +3340,7 @@ static uint8_t _golCountNeighbours(uint8_t x, uint8_t y) {
 #if DEBUG_SERIAL && DEBUG_LIFE
 
 static const char* const _golSeedNames[SEED_COUNT] = {
-    "RANDOM", "STILLLIFE", "OSCILLATOR", "SPACESHIP", "METHUSELAH"
+    "RANDOM", "STILLLIFE", "OSCILLATOR", "SPACESHIP", "METHUSELAH", "LENIA"
 };
 static const char* const _golPalNames[GOL_PAL_COUNT] = {
     "EMBER", "AURORA", "TOXIC", "COSMOS", "MAGMA", "BIOLUM", "VOID", "SPECTRUM"
@@ -3254,6 +3371,97 @@ static void _golPrintGrid() {
 }
 
 #endif // DEBUG_SERIAL && DEBUG_LIFE
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LENIA SIMULATION STEP
+//
+// Multi-kernel continuous cellular automaton (Chan 2019 — "Lenia").
+//
+// Update rule — Euler integration:
+//
+//   u_i(x,y)  = Σ K_i(dx,dy) · A(x+dx, y+dy) / K_i_sum     (convolution)
+//   g_i       = G_i(u_i)  ∈ [−1, +1]                        (growth)
+//   A(t+dt)   = clip(A(t) + dt · Σᵢ wᵢ · gᵢ,  0, 1)        (Euler step)
+//
+// Growth function  G(u; μ, σ) = 2·exp(–(u–μ)²/(2σ²)) – 1:
+//   • G = +1  when u = μ  (maximum growth at the "right" neighbourhood density)
+//   • G → −1  when u ≫ μ or u ≪ μ  (decay at wrong density)
+//
+// Two kernels compete on different length scales:
+//   K1 (short-range, R≈2): stabilises dense local clusters  μ₁=0.35, σ₁=0.12
+//   K2 (long-range,  R≈3.5): provides global coupling       μ₂=0.15, σ₂=0.08
+//
+// Colour: _golAge[][] is written as (1−field)×250 so high activation (bright)
+// maps to a low age (hot palette entry) — a natural "temperature" metaphor.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Lenia growth function G(u; μ, σ) → [−1, +1]
+static inline float _lenGrowth(float u, float mu, float sigma) {
+    float d = (u - mu) / sigma;
+    return 2.0f * expf(-0.5f * d * d) - 1.0f;
+}
+
+// Helper: write _golAge from the current _lenField (used after every Lenia step)
+static void _lenSyncAge() {
+    for (uint8_t y = 0; y < GOL_H; y++)
+        for (uint8_t x = 0; x < GOL_W; x++) {
+            float v = _lenField[y][x];
+            // Invert: high activation → low age → hot palette colour
+            _golAge[y][x] = (v > LEN_ALIVE_THR)
+                          ? (uint8_t)fmaxf(1.0f, (1.0f - v) * 250.0f)
+                          : 0;
+        }
+}
+
+static bool _lenStep() {
+    // Growth function parameters per kernel
+    const float mu1 = 0.35f, sg1 = 0.12f, w1 = 0.60f;   // K1 short-range
+    const float mu2 = 0.15f, sg2 = 0.08f, w2 = 0.40f;   // K2 long-range
+    const float dt  = 0.10f;   // Euler step size (stable for these σ values)
+
+    bool changed = false;
+
+    for (uint8_t y = 0; y < GOL_H; y++) {
+        for (uint8_t x = 0; x < GOL_W; x++) {
+
+            // ── Kernel convolution (toroidal wrap) ────────────────────────────
+            // Both kernels share the same spatial loop; zero-weight entries
+            // are skipped for efficiency.
+            float u1 = 0.0f, u2 = 0.0f;
+            for (int ky = -3; ky <= 3; ky++) {
+                for (int kx = -3; kx <= 3; kx++) {
+                    float k1 = _lenK1[ky + 3][kx + 3];
+                    float k2 = _lenK2[ky + 3][kx + 3];
+                    if (k1 < 1e-4f && k2 < 1e-4f) continue;
+                    uint8_t nx = (uint8_t)((x + kx + GOL_W * 4) % GOL_W);
+                    uint8_t ny = (uint8_t)((y + ky + GOL_H * 4) % GOL_H);
+                    float   v  = _lenField[ny][nx];
+                    u1 += k1 * v;
+                    u2 += k2 * v;
+                }
+            }
+            // Normalise so u ∈ [0,1] regardless of which kernel entries fired
+            if (_lenK1sum > 1e-6f) u1 /= _lenK1sum;
+            if (_lenK2sum > 1e-6f) u2 /= _lenK2sum;
+
+            // ── Weighted growth update ────────────────────────────────────────
+            float g  = w1 * _lenGrowth(u1, mu1, sg1)
+                     + w2 * _lenGrowth(u2, mu2, sg2);
+            float nv = _lenField[y][x] + dt * g;
+            nv = fmaxf(0.0f, fminf(1.0f, nv));
+            _lenNext[y][x] = nv;
+
+            // Stasis: any alive↔dead threshold crossing counts as "changed"
+            bool wasAlive = (_lenField[y][x] > LEN_ALIVE_THR);
+            bool nowAlive = (nv             > LEN_ALIVE_THR);
+            if (wasAlive != nowAlive) changed = true;
+        }
+    }
+
+    memcpy(_lenField, _lenNext, sizeof(_lenField));
+    _lenSyncAge();
+    return changed;
+}
 
 // Returns true if anything changed (stasis detection)
 static bool _golStep() {
@@ -3320,8 +3528,11 @@ static CRGB _golAgeToColor(uint8_t age, uint8_t palIdx, uint8_t hueDrift) {
 
 static void _golInit() {
     _golBuildPalettes();
-    memset(_golAge,  0, sizeof(_golAge));
-    memset(_golNext, 0, sizeof(_golNext));
+    _lenBuildKernels();
+    memset(_golAge,    0, sizeof(_golAge));
+    memset(_golNext,   0, sizeof(_golNext));
+    memset(_lenField,  0, sizeof(_lenField));
+    memset(_lenNext,   0, sizeof(_lenNext));
 
     _golSeedType   = 0;
     _golPalIdx     = 0;
@@ -3331,6 +3542,9 @@ static void _golInit() {
     _golFadeFrame  = 0;
     _golLastStep   = millis();
     _golGeneration = 0;
+    memset(_golSnap1Ago, 0, sizeof(_golSnap1Ago));
+    memset(_golSnap2Ago, 0, sizeof(_golSnap2Ago));
+    _golOscCount   = 0;
 
     // Randomise first reset time: GOL_RESET_MIN..GOL_RESET_MAX seconds
     _golResetAt = millis() + (uint32_t)(GOL_RESET_MIN + random8(GOL_RESET_MAX - GOL_RESET_MIN)) * 1000UL;
@@ -3389,6 +3603,9 @@ static void renderLife() {
             _golHueDrift = (_golHueDrift + GOL_HUE_DRIFT_SPEED) & 0xFF;
             _golStasis   = 0;
             _golGeneration = 0;
+            memset(_golSnap1Ago, 0, sizeof(_golSnap1Ago));
+            memset(_golSnap2Ago, 0, sizeof(_golSnap2Ago));
+            _golOscCount = 0;
             _golApplySeed(_golSeedType);
 #if DEBUG_SERIAL && DEBUG_LIFE
             if (Serial) {
@@ -3450,37 +3667,63 @@ static void renderLife() {
 
     // ── Normal running phase ──────────────────────────────────────────────────
 
-    // Beat: randomly flip GOL_BEAT_FLIPS cells to inject chaos
+    // Beat: inject energy into the simulation.
+    //   GoL  — randomly flip GOL_BEAT_FLIPS cells.
+    //   Lenia — add or remove a smooth Gaussian blob at a random location.
     if (beatFired) {
-#if DEBUG_SERIAL && DEBUG_LIFE
-        // Printed once per detected beat. Lists the (col, row) of every cell
-        // that was toggled. "alive→dead" means the cell was live and is now
-        // killed; "dead→alive" means it was empty and is now spawned at age 1.
-        // This shows exactly which cells received the beat injection.
-        if (Serial) {
-            Serial.print(F("[GoL] beat @ gen=")); Serial.print(_golGeneration);
-            Serial.print(F("  flipping ")); Serial.print(GOL_BEAT_FLIPS); Serial.println(F(" cells:"));
-        }
-#endif
-        for (uint8_t i = 0; i < GOL_BEAT_FLIPS; i++) {
-            uint8_t bx = random8(GOL_W);
-            uint8_t by = random8(GOL_H);
-            bool wasAlive = (_golAge[by][bx] > 0);
-            // Toggle: dead→alive, alive→dead
-            _golAge[by][bx] = wasAlive ? 0 : 1;
+        if (_golSeedType == SEED_LENIA) {
 #if DEBUG_SERIAL && DEBUG_LIFE
             if (Serial) {
-                Serial.print(F("[GoL]   col=")); Serial.print(bx);
-                Serial.print(F(" row=")); Serial.print(by);
-                Serial.println(wasAlive ? F("  alive→dead") : F("  dead→alive"));
+                Serial.print(F("[GoL] beat @ gen=")); Serial.print(_golGeneration);
+                Serial.println(F("  Lenia: injecting Gaussian blob"));
             }
 #endif
+            // Sign alternates: beat sometimes adds energy, sometimes removes it.
+            // Spread factor 3.0 gives a blob ~1 cell in radius.
+            float cx  = (float)random8(GOL_W);
+            float cy  = (float)random8(GOL_H);
+            float amp = (random8(2) == 0) ? 0.35f : -0.35f;
+            for (uint8_t by = 0; by < GOL_H; by++) {
+                for (uint8_t bx = 0; bx < GOL_W; bx++) {
+                    float ddx = fabsf((float)bx - cx);
+                    if (ddx > GOL_W * 0.5f) ddx = GOL_W - ddx;
+                    float ddy = fabsf((float)by - cy);
+                    if (ddy > GOL_H * 0.5f) ddy = GOL_H - ddy;
+                    float nv = _lenField[by][bx] + amp * expf(-(ddx * ddx + ddy * ddy) * 0.5f);
+                    _lenField[by][bx] = fmaxf(0.0f, fminf(1.0f, nv));
+                }
+            }
+            _lenSyncAge();
+        } else {
+#if DEBUG_SERIAL && DEBUG_LIFE
+            // Printed once per detected beat. Lists the (col, row) of every cell
+            // that was toggled. "alive→dead" means the cell was live and is now
+            // killed; "dead→alive" means it was empty and is now spawned at age 1.
+            if (Serial) {
+                Serial.print(F("[GoL] beat @ gen=")); Serial.print(_golGeneration);
+                Serial.print(F("  flipping ")); Serial.print(GOL_BEAT_FLIPS); Serial.println(F(" cells:"));
+            }
+#endif
+            for (uint8_t i = 0; i < GOL_BEAT_FLIPS; i++) {
+                uint8_t bx = random8(GOL_W);
+                uint8_t by = random8(GOL_H);
+                bool wasAlive = (_golAge[by][bx] > 0);
+                _golAge[by][bx] = wasAlive ? 0 : 1;
+#if DEBUG_SERIAL && DEBUG_LIFE
+                if (Serial) {
+                    Serial.print(F("[GoL]   col=")); Serial.print(bx);
+                    Serial.print(F(" row=")); Serial.print(by);
+                    Serial.println(wasAlive ? F("  alive→dead") : F("  dead→alive"));
+                }
+#endif
+            }
         }
     }
 
-    // Advance simulation every GOL_STEP_MS
-    if ((uint32_t)(now - _golLastStep) >= GOL_STEP_MS) {
-        bool changed = _golStep();
+    // Advance simulation: Lenia steps faster and uses continuous rules.
+    uint32_t stepMs = (_golSeedType == SEED_LENIA) ? LEN_STEP_MS : GOL_STEP_MS;
+    if ((uint32_t)(now - _golLastStep) >= stepMs) {
+        bool changed = (_golSeedType == SEED_LENIA) ? _lenStep() : _golStep();
         _golLastStep = now;
         _golGeneration++;
 
@@ -3508,6 +3751,30 @@ static void renderLife() {
             _golStasis = 0;
         }
 
+        // Period-2 oscillation detection (GoL only — Lenia has its own dynamics)
+        if (_golSeedType != SEED_LENIA && _golFadeState == 0 && _golGeneration > 2) {
+            if (memcmp(_golAge, _golSnap2Ago, sizeof(_golAge)) == 0) {
+                if (++_golOscCount >= GOL_OSC_RESET_N) {
+#if DEBUG_SERIAL && DEBUG_LIFE
+                    if (Serial) {
+                        Serial.print(F("[GoL] OSC-STUCK at gen=")); Serial.print(_golGeneration);
+                        Serial.print(F("  osc-count=")); Serial.print(_golOscCount);
+                        Serial.println(F("  → fade-out"));
+                    }
+#endif
+                    memcpy(_golFadeSnap, _golAge, sizeof(_golAge));
+                    _golFadeState = 1;
+                    _golFadeFrame = 0;
+                    _golStasis    = 0;
+                    _golOscCount  = 0;
+                }
+            } else {
+                _golOscCount = 0;
+            }
+            memcpy(_golSnap2Ago, _golSnap1Ago, sizeof(_golAge));
+            memcpy(_golSnap1Ago, _golAge,      sizeof(_golAge));
+        }
+
 #if DEBUG_SERIAL && DEBUG_LIFE
         if (Serial) {
             // Printed every simulation step (every GOL_STEP_MS milliseconds).
@@ -3517,6 +3784,7 @@ static void renderLife() {
             // cells  = number of live cells on the 8×8 grid (0–64).
             // stasis = consecutive unchanged generations / threshold.
             //          When stasis reaches the threshold a reset is triggered.
+            // osc    = consecutive period-2 matches / threshold.
             // The ASCII grid follows: '#' = live cell, '.' = dead cell.
             // Row 0 of the grid = bottom row of the physical matrix (DRAW_Y).
             Serial.print(F("[GoL] gen=")); Serial.print(_golGeneration);
@@ -3524,7 +3792,9 @@ static void renderLife() {
             Serial.print(F("  pal=")); Serial.print(_golPalNames[_golPalIdx]);
             Serial.print(F("  cells=")); Serial.print(_golCountCells());
             Serial.print(F("  stasis=")); Serial.print(_golStasis);
-            Serial.print(F("/")); Serial.println(GOL_STASIS_FRAMES);
+            Serial.print(F("/")); Serial.print(GOL_STASIS_FRAMES);
+            Serial.print(F("  osc=")); Serial.print(_golOscCount);
+            Serial.print(F("/")); Serial.println(GOL_OSC_RESET_N);
             _golPrintGrid();
         }
 #endif
@@ -3559,7 +3829,438 @@ static void renderLife() {
         }
     }
 }
+// ═════════════════════════════════════════════════════════════════════════════
+// MODE_MICROBE — paramecium-inspired single-organism simulation
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ── Behaviour overview ────────────────────────────────────────────────────────
+//
+//   One organism lives on the 8×8 toroidal grid (edges wrap).
+//   It is 3–6 pixels in size, moves with gentle curves, and interacts
+//   with food pixels scattered across the grid.
+//
+//   BODY SHAPE
+//     Stored as up to MCB_MAX_BODY relative (dx, dy) offsets from a head
+//     pixel plus a separate nucleus offset.  Five hand-crafted seed shapes
+//     are chosen at spawn.  They are rotated to match the direction of travel
+//     using 8-direction (45°) quantised rotation so pixels stay on the integer
+//     LED grid.  The nucleus is always the most interior pixel — never on the
+//     leading or trailing edge.
+//
+//   MOVEMENT
+//     Sub-pixel position (float x, y) drifts at MCB_SPEED pixels/ms.
+//     Direction evolves slowly: each step a small random angular nudge
+//     ±MCB_CURVE_MAX is added (gentle curve), and every MCB_VEER_INTERVAL ms
+//     a larger spontaneous veer fires (abrupt direction change).
+//     Position wraps toroidally.
+//
+//   FOOD
+//     MCB_FOOD_COUNT single green pixels are scattered at init, never on the
+//     organism.  When the head pixel comes within 1 pixel of food:
+//       50% EATING:   organism halts MCB_EAT_PAUSE_MS, food flashes white,
+//                     organism grows one pixel (up to MCB_MAX_BODY), food
+//                     reappears elsewhere after MCB_FOOD_RESPAWN_MS.
+//       50% AVOIDANCE: angle swings 72°–108° away, food flashes red briefly.
+//                      No growth; food stays.
+//     Only the nearest food triggers per frame.
+//
+//   AGING + COLOR
+//     Lifespan randomised MCB_LIFE_MIN_MS – MCB_LIFE_MAX_MS at spawn.
+//     Age fraction t drives colour:
+//       0.0–0.5  healthy  : saturated cyan-green (H=140)
+//       0.5–0.8  maturing : hue slides toward orange (H=30)
+//       0.8–1.0  dying    : hue → red, desaturation, dimming
+//     At t=1.0: organism disappears for MCB_DEATH_FADE_MS then respawns.
+//
+//   FLAGELLA
+//     The 1–2 rearmost body pixels flicker on/off every 80–140 ms.
+//     Flagella are drawn MCB_FLAG_DIM brightness units darker than the body.
+//     Flicker is suppressed during eat-pause (organism is stationary).
+//
+//   BEAT RESPONSE
+//     beatFired triggers a brief nucleus brightness burst (+60, 3 frames).
+//
+// ── Tuning constants ──────────────────────────────────────────────────────────
 
+#define MCB_MAX_BODY         4
+#define MCB_MIN_BODY         1
+#define MCB_FOOD_COUNT       1
+#define MCB_SPEED            0.004f    // pixels / ms
+#define MCB_CURVE_MAX        0.08f     // max angular nudge / step (radians)
+#define MCB_VEER_INTERVAL   1400UL    // ms between spontaneous veers
+#define MCB_VEER_AMOUNT      1.3f     // magnitude of spontaneous veer (radians)
+#define MCB_EAT_PAUSE_MS     420UL
+#define MCB_FOOD_RESPAWN_MS 2800UL
+#define MCB_LIFE_MIN_MS   300000UL    // 5 minutes
+#define MCB_LIFE_MAX_MS   600000UL    // 10 minutes
+#define MCB_DEATH_FADE_MS   1200UL
+#define MCB_FLAG_DIM         60       // brightness reduction on flagella pixels
+#define MCB_NUC_FLASH_FRAMES  3
+
+// ── Body shape definitions ─────────────────────────────────────────────────────
+// Offsets relative to head pixel (0,0).  Defined for east travel (dx>0=forward).
+// Rotation is applied at draw time.  Index 0 is always the head.
+
+struct McbPixel { int8_t dx; int8_t dy; };
+
+// Shape 0: straight 3-px slug  ●──●──●
+static const McbPixel _mcbS0[] = {{0,0},{-1,0},{-2,0}};
+// Shape 1: diagonal 4-px      ●
+//                               ●
+//                                ●
+//                                 ●
+static const McbPixel _mcbS1[] = {{0,0},{-1,0},{-1,-1},{-2,-1}};
+// Shape 2: 2×2 compact         ●●
+//                               ●●
+static const McbPixel _mcbS2[] = {{0,0},{-1,0},{0,-1},{-1,-1}};
+// Shape 3: elongated 5-px with bump  ●──●──●──●──●
+//                                              ●
+static const McbPixel _mcbS3[] = {{0,0},{-1,0},{-2,0},{-3,0},{-2,-1}};
+// Shape 4: chunky 6-px 3×2 blob  ●●●
+//                                  ●●●
+static const McbPixel _mcbS4[] = {{0,0},{-1,0},{-2,0},{0,-1},{-1,-1},{-2,-1}};
+
+static const McbPixel* const _mcbShapes[]    = {_mcbS0,_mcbS1,_mcbS2,_mcbS3,_mcbS4};
+static const uint8_t         _mcbShapeLen[]  = {3,4,4,5,6};
+static const uint8_t         _mcbNucIdx[]    = {1,2,3,2,4};
+// Nucleus indices chosen as the most interior pixel of each shape.
+#define MCB_SHAPE_COUNT 5
+
+// ── Food structure ─────────────────────────────────────────────────────────────
+struct McbFood {
+    int8_t   x, y;
+    bool     alive;
+    uint32_t respawnAt;
+    uint8_t  flashR, flashG, flashB;
+    uint8_t  flashFrames;
+};
+
+// ── Organism state ─────────────────────────────────────────────────────────────
+static struct {
+    float    x, y;
+    float    angle;
+    uint8_t  bodyLen;
+    uint8_t  shapeIdx;
+    uint8_t  nucIdx;
+    uint32_t spawnMs;
+    uint32_t lifespanMs;
+    bool     eating;
+    uint32_t eatEndMs;
+    uint32_t lastMoveMs;
+    uint32_t lastVeerMs;
+    uint8_t  flagCount;
+    uint8_t  flagBodyIdx[2];
+    uint32_t flagNextMs[2];
+    bool     flagOn[2];
+    bool     dying;
+    uint32_t deathStartMs;
+    uint8_t  nucFlashFrames;
+} _mcb;
+
+static McbFood _mcbFood[MCB_FOOD_COUNT];
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+static inline float _mcbWrapF(float v, float lim) {
+    while (v < 0.0f)   v += lim;
+    while (v >= lim)   v -= lim;
+    return v;
+}
+
+static inline int8_t _mcbWrapI(int v, int lim) {
+    v %= lim;
+    if (v < 0) v += lim;
+    return (int8_t)v;
+}
+
+static void _mcbHsv(uint8_t h, uint8_t s, uint8_t v,
+                    uint8_t &r, uint8_t &g, uint8_t &b) {
+    if (s == 0) { r = g = b = v; return; }
+    uint8_t region = h / 43;
+    uint8_t rem    = (h - region * 43) * 6;
+    uint8_t p = (uint16_t)v * (255 - s) >> 8;
+    uint8_t q = (uint16_t)v * (255 - ((uint16_t)s * rem >> 8)) >> 8;
+    uint8_t t = (uint16_t)v * (255 - ((uint16_t)s * (255 - rem) >> 8)) >> 8;
+    switch (region) {
+        case 0: r=v;g=t;b=p; break; case 1: r=q;g=v;b=p; break;
+        case 2: r=p;g=v;b=t; break; case 3: r=p;g=q;b=v; break;
+        case 4: r=t;g=p;b=v; break; default:r=v;g=p;b=q; break;
+    }
+}
+
+// Rotate shape pixel by angle, quantised to 8 directions (45° steps)
+static void _mcbRotate(int8_t dx, int8_t dy, float angle, int &rx, int &ry) {
+    int sector = (int)roundf(angle / (M_PI * 0.25f)) & 7;
+    static const int8_t cT[8] = { 1, 1, 0,-1,-1,-1, 0, 1};
+    static const int8_t sT[8] = { 0,-1,-1,-1, 0, 1, 1, 1};
+    rx = (int)dx * cT[sector] - (int)dy * sT[sector];
+    ry = (int)dx * sT[sector] + (int)dy * cT[sector];
+}
+
+static bool _mcbOrgHas(int8_t x, int8_t y) {
+    const McbPixel* sh = _mcbShapes[_mcb.shapeIdx];
+    int hx = (int)roundf(_mcb.x);
+    int hy = (int)roundf(_mcb.y);
+    if (hx < 0) hx = 0; if (hx >= MATRIX_COLS) hx = MATRIX_COLS-1;
+    if (hy < 0) hy = 0; if (hy >= MATRIX_ROWS) hy = MATRIX_ROWS-1;
+    for (uint8_t i = 0; i < _mcb.bodyLen; i++) {
+        int rx, ry;
+        _mcbRotate(sh[i].dx, sh[i].dy, _mcb.angle, rx, ry);
+        int px = hx + rx;
+        int py = hy + ry;
+        if (px == (int)x && py == (int)y) return true;
+    }
+    return false;
+}
+
+static void _mcbSpawnFood(uint8_t idx) {
+    for (uint8_t att = 0; att < 40; att++) {
+        int8_t fx = (int8_t)(random8() % MATRIX_COLS);
+        int8_t fy = (int8_t)(random8() % MATRIX_ROWS);
+        if (_mcbOrgHas(fx, fy)) continue;
+        bool clash = false;
+        for (uint8_t j = 0; j < MCB_FOOD_COUNT; j++) {
+            if (j != idx && _mcbFood[j].alive &&
+                _mcbFood[j].x==fx && _mcbFood[j].y==fy) { clash=true; break; }
+        }
+        if (!clash) {
+            _mcbFood[idx]={fx,fy,true,0,0,0,0,0};
+            return;
+        }
+    }
+    _mcbFood[idx]={(int8_t)(random8()%MATRIX_COLS),(int8_t)(random8()%MATRIX_ROWS),true,0,0,0,0,0};
+}
+
+static inline float _mcbAgeFrac() {
+    uint32_t e = millis() - _mcb.spawnMs;
+    float f = (float)e / (float)_mcb.lifespanMs;
+    return f > 1.0f ? 1.0f : f;
+}
+
+static void _mcbBodyColor(float t, uint8_t &r, uint8_t &g, uint8_t &b) {
+    uint8_t h, s, v;
+    if (t < 0.5f)      { h=140; s=240; v=200; }
+    else if (t < 0.8f) { float u=(t-0.5f)/0.3f; h=(uint8_t)(140-u*110); s=230; v=190; }
+    else               { float u=(t-0.8f)/0.2f; h=(uint8_t)(30-u*25); s=(uint8_t)(230-u*130); v=(uint8_t)(180*(1.0f-u*0.5f)); }
+    _mcbHsv(h,s,v,r,g,b);
+}
+
+static void _mcbNucColor(float t, uint8_t &r, uint8_t &g, uint8_t &b) {
+    uint8_t h = t<0.5f ? 180 : t<0.8f ? 60 : 0;
+    uint8_t s = t<0.8f ? 255 : (uint8_t)(255*(1.0f-(t-0.8f)/0.2f*0.4f));
+    _mcbHsv(h, s, 255, r, g, b);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────────
+static void _mcbInit() {
+    uint32_t now = millis();
+    _mcb.shapeIdx     = random8() % MCB_SHAPE_COUNT;
+    // Always start at 1 pixel; grow by eating food (up to MCB_MAX_BODY,
+    // but only during the first half of life).
+    _mcb.bodyLen      = 1;
+    // Nucleus must be within the active body; clamp to last pixel if needed.
+    _mcb.nucIdx       = _mcbNucIdx[_mcb.shapeIdx];
+    if (_mcb.nucIdx >= _mcb.bodyLen) _mcb.nucIdx = _mcb.bodyLen - 1;
+    _mcb.x            = (float)(random8() % MATRIX_COLS);
+    _mcb.y            = (float)(random8() % MATRIX_ROWS);
+    _mcb.angle        = (float)(random8()) / 255.0f * 2.0f * M_PI;
+    _mcb.spawnMs      = now;
+    _mcb.lifespanMs   = MCB_LIFE_MIN_MS +
+                        (uint32_t)(random16() % (MCB_LIFE_MAX_MS - MCB_LIFE_MIN_MS));
+    _mcb.lastMoveMs   = now;
+    _mcb.lastVeerMs   = now;
+    _mcb.eating       = false;
+    _mcb.dying        = false;
+    _mcb.nucFlashFrames = 0;
+    // No flagella at size 1; they are added when the organism grows to size 2.
+    _mcb.flagCount    = 0;
+    for (uint8_t i = 0; i < MCB_FOOD_COUNT; i++) {
+        _mcbFood[i] = {0,0,false,0,0,0,0,0};
+        _mcbSpawnFood(i);
+    }
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────────
+static void renderMicrobe() {
+    matrix.setBrightness(BRIGHTNESS);
+    matrix.fillScreen(0);
+    uint32_t now = millis();
+
+    // Death: blank display, wait, respawn
+    if (_mcb.dying) {
+        if ((now - _mcb.deathStartMs) >= MCB_DEATH_FADE_MS) _mcbInit();
+        return;
+    }
+    // Lifespan expired
+    if (_mcbAgeFrac() >= 1.0f) { _mcb.dying=true; _mcb.deathStartMs=now; return; }
+
+    // ── Movement ──────────────────────────────────────────────────────────────
+    if (!_mcb.eating) {
+        uint32_t dt = now - _mcb.lastMoveMs;
+        _mcb.lastMoveMs = now;
+
+        // Spontaneous large veer
+        if ((now - _mcb.lastVeerMs) >= MCB_VEER_INTERVAL) {
+            _mcb.lastVeerMs = now;
+            float v = MCB_VEER_AMOUNT * (((float)(random8())/255.0f) - 0.5f) * 2.0f;
+            _mcb.angle += v;
+        }
+        // Gentle curve nudge
+        _mcb.angle += MCB_CURVE_MAX * (((float)(random8())/255.0f) - 0.5f) * 2.0f;
+        while (_mcb.angle < 0.0f)          _mcb.angle += 2.0f*M_PI;
+        while (_mcb.angle >= 2.0f*M_PI)    _mcb.angle -= 2.0f*M_PI;
+
+        float dist = MCB_SPEED * (float)dt;
+        float nx = _mcb.x + cosf(_mcb.angle) * dist;
+        float ny = _mcb.y - sinf(_mcb.angle) * dist;
+        // Bounce off edges — reflect the velocity component that crossed a wall
+        if (nx < 0.0f)                     { nx = -nx;                              _mcb.angle = M_PI - _mcb.angle; }
+        if (nx >= (float)MATRIX_COLS)      { nx = 2.0f*(float)MATRIX_COLS - nx - 1.0f; _mcb.angle = M_PI - _mcb.angle; }
+        if (ny < 0.0f)                     { ny = -ny;                              _mcb.angle = -_mcb.angle; }
+        if (ny >= (float)MATRIX_ROWS)      { ny = 2.0f*(float)MATRIX_ROWS - ny - 1.0f; _mcb.angle = -_mcb.angle; }
+        while (_mcb.angle < 0.0f)          _mcb.angle += 2.0f * M_PI;
+        while (_mcb.angle >= 2.0f * M_PI)  _mcb.angle -= 2.0f * M_PI;
+        _mcb.x = nx;
+        _mcb.y = ny;
+
+        // Food interaction (no toroidal distance — direct euclidean on bounded grid)
+        int hx = (int)roundf(_mcb.x);
+        int hy = (int)roundf(_mcb.y);
+        if (hx < 0) hx = 0; if (hx >= MATRIX_COLS) hx = MATRIX_COLS-1;
+        if (hy < 0) hy = 0; if (hy >= MATRIX_ROWS) hy = MATRIX_ROWS-1;
+        for (uint8_t fi = 0; fi < MCB_FOOD_COUNT; fi++) {
+            if (!_mcbFood[fi].alive) continue;
+            int fdx = abs((int)_mcbFood[fi].x - hx);
+            int fdy = abs((int)_mcbFood[fi].y - hy);
+            if (fdx<=1 && fdy<=1) {
+                if (random8() & 1) {
+                    // EAT
+                    _mcb.eating = true;
+                    _mcb.eatEndMs = now + MCB_EAT_PAUSE_MS;
+                    _mcbFood[fi].flashR=255; _mcbFood[fi].flashG=255;
+                    _mcbFood[fi].flashB=255; _mcbFood[fi].flashFrames=6;
+                    _mcbFood[fi].alive=false;
+                    _mcbFood[fi].respawnAt = now + MCB_FOOD_RESPAWN_MS;
+                    // Only grow in the first half of life, up to MCB_MAX_BODY
+                    if (_mcb.bodyLen < MCB_MAX_BODY && _mcbAgeFrac() < 0.5f) {
+                        _mcb.bodyLen++;
+                        if (_mcb.bodyLen == 2) {
+                            // First growth: add one flagellum
+                            _mcb.flagBodyIdx[0] = 1;
+                            _mcb.flagNextMs[0]  = now + 200 + (uint32_t)(random8() % 150);
+                            _mcb.flagOn[0]      = true;
+                            _mcb.flagCount      = 1;
+                        } else if (_mcb.flagCount < 2) {
+                            _mcb.flagBodyIdx[_mcb.flagCount] = _mcb.bodyLen-1;
+                            _mcb.flagNextMs[_mcb.flagCount]  = now + 200 + (uint32_t)(random8() % 150);
+                            _mcb.flagOn[_mcb.flagCount]      = true;
+                            _mcb.flagCount++;
+                        } else {
+                            _mcb.flagBodyIdx[0] = _mcb.bodyLen-1;
+                            _mcb.flagBodyIdx[1] = _mcb.bodyLen-2;
+                        }
+                    }
+                } else {
+                    // AVOID
+                    float fa = atan2f((float)(_mcbFood[fi].y-hy),
+                                      (float)(_mcbFood[fi].x-hx));
+                    float veer = (M_PI*0.4f)*(random8()&1 ? 1.0f:-1.0f);
+                    _mcb.angle = fa + M_PI + veer;
+                    while (_mcb.angle<0.0f)       _mcb.angle += 2.0f*M_PI;
+                    while (_mcb.angle>=2.0f*M_PI) _mcb.angle -= 2.0f*M_PI;
+                    _mcbFood[fi].flashR=200; _mcbFood[fi].flashG=20;
+                    _mcbFood[fi].flashB=20;  _mcbFood[fi].flashFrames=4;
+                }
+                break;
+            }
+        }
+    } else {
+        if (now >= _mcb.eatEndMs) _mcb.eating=false;
+    }
+
+    // Flagella flicker — slower and more deliberate than before
+    if (!_mcb.eating) {
+        for (uint8_t i=0;i<_mcb.flagCount;i++) {
+            if (now >= _mcb.flagNextMs[i]) {
+                _mcb.flagOn[i]     = !_mcb.flagOn[i];
+                _mcb.flagNextMs[i] = now + 200 + (uint32_t)(random8() % 150);
+            }
+        }
+    }
+
+    // Food respawn
+    for (uint8_t i=0;i<MCB_FOOD_COUNT;i++)
+        if (!_mcbFood[i].alive && now>=_mcbFood[i].respawnAt)
+            _mcbSpawnFood(i);
+
+    // Beat nucleus flash
+    if (beatFired) _mcb.nucFlashFrames = MCB_NUC_FLASH_FRAMES;
+    if (_mcb.nucFlashFrames > 0) _mcb.nucFlashFrames--;
+
+    // Colors
+    float ageFrac = _mcbAgeFrac();
+    uint8_t br,bg,bb,nr,ng,nb;
+    _mcbBodyColor(ageFrac, br,bg,bb);
+    _mcbNucColor (ageFrac, nr,ng,nb);
+    if (_mcb.nucFlashFrames > 0) {
+        float f=(float)_mcb.nucFlashFrames/MCB_NUC_FLASH_FRAMES;
+        nr=(uint8_t)min(255,(int)nr+(int)(f*60));
+        ng=(uint8_t)min(255,(int)ng+(int)(f*60));
+        nb=(uint8_t)min(255,(int)nb+(int)(f*60));
+    }
+
+    // Draw food
+    for (uint8_t fi=0;fi<MCB_FOOD_COUNT;fi++) {
+        if (_mcbFood[fi].flashFrames > 0) {
+            float f=(float)_mcbFood[fi].flashFrames/6.0f;
+            matrix.drawPixel(_mcbFood[fi].x, DRAW_Y(_mcbFood[fi].y),
+                matrix.Color((uint8_t)(_mcbFood[fi].flashR*f),
+                             (uint8_t)(_mcbFood[fi].flashG*f),
+                             (uint8_t)(_mcbFood[fi].flashB*f)));
+            _mcbFood[fi].flashFrames--;
+        } else if (_mcbFood[fi].alive) {
+            matrix.drawPixel(_mcbFood[fi].x, DRAW_Y(_mcbFood[fi].y),
+                matrix.Color(40,180,40));
+        }
+    }
+
+    // Draw organism
+    const McbPixel* sh = _mcbShapes[_mcb.shapeIdx];
+    int hx = (int)roundf(_mcb.x);
+    int hy = (int)roundf(_mcb.y);
+    if (hx < 0) hx = 0; if (hx >= MATRIX_COLS) hx = MATRIX_COLS-1;
+    if (hy < 0) hy = 0; if (hy >= MATRIX_ROWS) hy = MATRIX_ROWS-1;
+
+    for (uint8_t i=0;i<_mcb.bodyLen;i++) {
+        int rx,ry;
+        _mcbRotate(sh[i].dx, sh[i].dy, _mcb.angle, rx,ry);
+        int px = hx + rx;
+        int py = hy + ry;
+        if (px < 0 || px >= MATRIX_COLS || py < 0 || py >= MATRIX_ROWS) continue;
+
+        bool isFlagellum=false, flagOn=true;
+        for (uint8_t fi=0;fi<_mcb.flagCount;fi++) {
+            if (_mcb.flagBodyIdx[fi]==i) { isFlagellum=true; flagOn=_mcb.flagOn[fi]; break; }
+        }
+        if (isFlagellum && !_mcb.eating && !flagOn) continue;
+
+        if (i == _mcb.nucIdx) {
+            matrix.drawPixel(px, DRAW_Y(py), matrix.Color(nr,ng,nb));
+        } else if (isFlagellum) {
+            matrix.drawPixel(px, DRAW_Y(py),
+                matrix.Color((uint8_t)max(0,(int)br-MCB_FLAG_DIM),
+                             (uint8_t)max(0,(int)bg-MCB_FLAG_DIM),
+                             (uint8_t)max(0,(int)bb-MCB_FLAG_DIM)));
+        } else if (i==0) {
+            matrix.drawPixel(px, DRAW_Y(py),
+                matrix.Color((uint8_t)min(255,(int)br+40),
+                             (uint8_t)min(255,(int)bg+40),
+                             (uint8_t)min(255,(int)bb+40)));
+        } else {
+            matrix.drawPixel(px, DRAW_Y(py), matrix.Color(br,bg,bb));
+        }
+    }
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // Init + Update — always compiled
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3604,6 +4305,7 @@ void visualizerInit() {
     _pcbaInit();
     _atomInit();
     _golInit();
+    _mcbInit();
 }
 
 // ── Runtime mode state (variable declared near top of file) ─────────────────
@@ -3639,6 +4341,7 @@ void visualizerSetMode(uint8_t mode) {
     if (mode == MODE_PCBA)      _pcbaInit();
     if (mode == MODE_ATOM)      _atomInit();
     if (mode == MODE_LIFE)      _golInit();
+    if (mode == MODE_MICROBE) _mcbInit();
     matrix.fillScreen(0);
     matrix.show();
 }
@@ -3678,6 +4381,7 @@ void visualizerUpdate() {
         case MODE_PCBA:                 renderPcba();       break;
         case MODE_ATOM:                 renderAtom();       break;
         case MODE_LIFE:                 renderLife();       break;
+        case MODE_MICROBE:              renderMicrobe();    break;
         default:                        renderSpectrum();   break;
     }
 

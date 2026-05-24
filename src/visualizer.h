@@ -92,6 +92,7 @@
     X(MODE_SINELON,              "Sinelon dot")                       \
     X(MODE_JUGGLE,               "Juggle dots")                       \
     X(MODE_LIFE,                 "Conway's Game of Life")             \
+    X(MODE_MICROBE,              "Paramecium microbe")                \
 // ── Auto-generate numeric IDs from the table ──────────────────────────────────
 // Each MODE_xxx constant equals its zero-based position in the table.
 // Never assign these manually — let the enum do it.

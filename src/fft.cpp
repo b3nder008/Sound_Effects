@@ -36,23 +36,35 @@ static const uint16_t bandBinEnd[NUM_BANDS] = {
    256    //   8 kHz (Nyquist for 16 kHz SR)
 };
  
-// ─── Peak tracking for normalisation ─────────────────────────────────────────
-static float peakHold[NUM_BANDS];
-#define PEAK_DECAY  0.990f   // ~2.2 s half-life at 31 fps — fast enough for dynamic range recovery
- 
+// ─── Per-band fixed scale ─────────────────────────────────────────────────────
+// Divides the above-floor signal to map to 0–1 before SENSITIVITY is applied.
+// Set each value to the above-floor magnitude expected at "full scale" (loud
+// music, not clipping). Starting point: ~4× the static noise floor.
+// Raise a band's value if it clips; lower it if bars stay near zero.
+static const float BAND_SCALE[NUM_BANDS] = {
+    7200.0f,  // B0  sub-bass   (~4× floor)
+    3500.0f,  // B1  bass
+    1250.0f,  // B2  low-mid
+     700.0f,  // B3  mid
+     500.0f,  // B4  upper-mid
+     440.0f,  // B5  presence
+     480.0f,  // B6  brilliance
+     400.0f,  // B7  air
+};
+
 // ─── Noise floor seed / static floor ─────────────────────────────────────────
 // Calibrated on ESP32-S3 XIAO + INMP441 + 22Ω + 1µF RC filter.
 // Derived from 4 calibration runs (R1/R2 unfiltered, R3/R4 RC-filtered).
 // Values = R3+R4 p95 average × 2.0.  Re-measure if hardware changes.
 static const float NOISE_FLOOR_STATIC[NUM_BANDS] = {
-     1990.6f,  // B0  sub-bass    85 Hz  R3+R4 avg ×1.10
-      958.2f,  // B1  bass       275 Hz  R3+R4 avg ×1.10
-      344.3f,  // B2  low-mid   600 Hz  R3+R4 avg ×1.10
-      196.7f,  // B3  mid      1400 Hz  R3+R4 avg ×1.10
-      135.7f,  // B4  upper-mid 3000 Hz  R3+R4 avg ×1.10
-      120.6f,  // B5  presence  5000 Hz  R3+R4 avg ×1.10
-      132.0f,  // B6  brilliance 7000 Hz  ×1.10
-      110.7f,  // B7  air       7500 Hz  ×1.10
+     1809.6f,  // B0  sub-bass    85 Hz  R3+R4 avg  SNR_min=14.1×
+      871.1f,  // B1  bass       275 Hz  R3+R4 avg  SNR_min=37.2×
+      313.0f,  // B2  low-mid   600 Hz  R3+R4 avg  SNR_min= 7.2×
+      178.8f,  // B3  mid      1400 Hz  R3+R4 avg  SNR_min=34.0×  (reference)
+      123.4f,  // B4  upper-mid 3000 Hz  R3+R4 avg  SNR_min= 9.8×
+      109.6f,  // B5  presence  5000 Hz  R3+R4 avg  SNR_min= 4.9×
+      120.0f,  // B6  brilliance 7000 Hz  floor identical both runs
+      100.6f,  // B7  air       7500 Hz  floor identical both runs
 };
  
 // ─── Per-band sensitivity ─────────────────────────────────────────────────────
@@ -73,15 +85,16 @@ static const float SENSITIVITY[NUM_BANDS] = {
 // Clamps adaptedFloor[] so it never collapses below measured ambient.
 // Values ≈ half of R3 p95 per band.
 static const float FLOOR_MIN[NUM_BANDS] = {
-      442.3f,  // B0  ×1.10
-      216.2f,  // B1  ×1.10
-       65.2f,  // B2  ×1.10
-       39.7f,  // B3  ×1.10
-       33.8f,  // B4  ×1.10
-       30.1f,  // B5  ×1.10
-       33.0f,  // B6  ×1.10
-       27.5f,  // B7  ×1.10
+      402.1f,  // B0  half of R3 p95 (conservative lower bound)
+      196.5f,  // B1
+       59.3f,  // B2
+       36.1f,  // B3
+       30.7f,  // B4
+       27.4f,  // B5
+       30.0f,  // B6
+       25.0f,  // B7
 };
+
 
 // ─── Per-band adaptive floor rise coefficient ─────────────────────────────────
 // Applied when raw > adaptedFloor (floor tracking up toward noise/signal).
@@ -220,8 +233,6 @@ static void _runCalibration() {
  
 // ─── fftInit ──────────────────────────────────────────────────────────────────
 void fftInit() {
-    memset(peakHold, 0, sizeof(peakHold));
- 
 #if FFT_AUTO_CALIBRATE
     // Seed adaptive floor with static values; fftCalibrate() will refine them.
     for (int b = 0; b < NUM_BANDS; b++) {
@@ -258,7 +269,6 @@ void fftProcess() {
     FFT.compute(FFT_FORWARD);
     FFT.complexToMagnitude(); // results in vReal[0..FFT_SIZE/2]
  
-    // ── 4. Accumulate bands ───────────────────────────────────────────────────
     for (int b = 0; b < NUM_BANDS; b++) {
         double sum = 0.0;
         int count = 0;
@@ -305,16 +315,10 @@ void fftProcess() {
         float avg = fmaxf(0.0f, raw_s - NOISE_FLOOR_STATIC[b]);
 #endif
  
-        // ── 5. Normalise against decaying peak ────────────────────────────────
-        peakHold[b] *= PEAK_DECAY;
-        if (avg > peakHold[b]) peakHold[b] = avg;
- 
-        float normalised = (peakHold[b] > 0.0f) ? (avg / peakHold[b]) : 0.0f;
- 
-        // ── 6. Apply per-band sensitivity, clamp to 1.0 ───────────────────────
-        normalised = fminf(1.0f, normalised * SENSITIVITY[b]);
- 
-        // ── 7. Smooth output (per-band IIR low-pass) ─────────────────────────
+        // ── 5. Normalise against fixed per-band scale, apply sensitivity ──────
+        float normalised = fminf(1.0f, (avg / BAND_SCALE[b]) * SENSITIVITY[b]);
+
+        // ── 8. Smooth output (per-band IIR low-pass) ─────────────────────────
         bandMagnitude[b] = bandMagnitude[b] * BAND_SMOOTH[b]
                          + normalised * (1.0f - BAND_SMOOTH[b]);
     }

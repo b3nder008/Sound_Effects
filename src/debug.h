@@ -20,5 +20,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #define DEBUG_SERIAL    1
 
-#define DEBUG_FFT_BANDS 0   // 0 = silent  1 = band magnitudes every frame
-#define DEBUG_LIFE      1   // 0 = silent  1 = GoL per-step state + grid
+#define DEBUG_FFT_BANDS 1   // 0 = silent  1 = band magnitudes every frame
+#define DEBUG_LIFE      0   // 0 = silent  1 = GoL per-step state + grid

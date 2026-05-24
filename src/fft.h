@@ -61,13 +61,13 @@
 // appear in silence; lower if quiet music is being eaten.
 #define FFT_CALIBRATE_MARGIN  1.5f
  
-// Per-band magnitude (0.0 – 1.0 after normalisation)
+// Per-band magnitude (0.0–1.0, smoothed output used by all render functions)
 extern float bandMagnitude[NUM_BANDS];
 // Per-band raw average magnitude before floor subtraction — use for floor tuning
 extern float bandRaw[NUM_BANDS];
 // Per-band trust flag — 0 if band is too noisy for reliable use, 1 if trusted
 extern const uint8_t BAND_TRUSTED[NUM_BANDS];
- 
+
 void fftInit();
 // Run FFT on audioProcessBuffer, populate bandMagnitude[], clear audioBufferReady
 void fftProcess();
