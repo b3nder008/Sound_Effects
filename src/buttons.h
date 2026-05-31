@@ -2,24 +2,23 @@
 /*
  * buttons.h
  * ─────────────────────────────────────────────────────────────────────────────
- * Three physical buttons for the XIAO ESP32-C3 LED matrix.
+ * Three physical buttons for the XIAO ESP32-S3 LED matrix.
  *
  * ── GPIO assignments ───────────────────────────────────────────────────────
  *
  *   Button        Pin   GPIO   Notes
  *   ──────────────────────────────────────────────────────────────────────────
- *   BTN_MODE      D3    GPIO5  Cycle through effect modes
- *   BTN_POWER     D4    GPIO6  Toggle display on/off (audio keeps running)
- *   BTN_BRIGHT    D5    GPIO7  Step through 4 brightness levels
+ *   BTN_POWER     D2    GPIO3  Toggle display on/off (audio keeps running)
+ *   BTN_MODE      D8    GPIO7  Cycle through effect modes
+ *   BTN_BRIGHT    D7    GPIO44 Step through 4 brightness levels  ⚠ see note
  *
  * Wire each button between its GPIO pin and GND. INPUT_PULLUP is used
  * internally — no external resistor needed.
  *
- * These pins are free on the XIAO ESP32-C3 given the current wiring:
- *   I2S mic  : D2(SD)  D6(WS)  D7(SCK)      -- D3/D4/D5 clear
- *   Matrix   : D10(DIN)                       -- D3/D4/D5 clear
- *   USB-CDC  : internal, no GPIO conflict
- *   SPI/I2C  : D4/D5 double as SDA/SCL but are free when I2C unused
+ * These pins are free on the XIAO ESP32-S3 given the current wiring:
+ *   I2S mic  : D3(WS)  D4(SCK)  D5(SD)       -- D2/D7/D8 clear
+ *   Matrix   : D10(DIN)                        -- D2/D7/D8 clear
+ *   USB-CDC  : internal GPIO19/20, no conflict with D2/D7/D8
  *
  * ── Pin constant type ──────────────────────────────────────────────────────
  *
@@ -70,9 +69,9 @@
 
 
 // ── GPIO pins — const int matches ESP32 Arduino digitalRead/pinMode API ───────
-const int BTN_POWER_PIN  = D2;   // GPIO3 — strapping pin, safe after boot
-const int BTN_MODE_PIN   = D8;   // GPIO44 - UART RX, see ⚠ warning in header
-const int BTN_BRIGHT_PIN = D7;   // GPIO7 — clean general-purpose GPIO
+const int BTN_POWER_PIN  = D2;   // GPIO3  — strapping pin, safe after boot
+const int BTN_MODE_PIN   = D8;   // GPIO7  — clean general-purpose GPIO
+const int BTN_BRIGHT_PIN = D7;   // GPIO44 — UART0 RX, see ⚠ warning above
 
 
 // ── Timing ────────────────────────────────────────────────────────────────────

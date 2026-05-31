@@ -49,10 +49,10 @@
 //   • Falls slowly  when raw < floor  → doesn't collapse on musical silences
 //
 // Coefficients are applied every FFT frame (~31 fps at 16 kHz / 512 samples).
-// RISE: floor tracks slow ambient drift only — matches FALL rate so the floor
-//       does not chase transients or music (~3000 frames / ~97 s to converge).
-// FALL: floor decays to a lower level in ~3000 frames (~97 s)
-// FFT_FLOOR_RISE_COEFF removed — replaced by per-band FLOOR_RISE_COEFF[] array in fft.cpp
+// RISE: per-band FLOOR_RISE_COEFF[] array in fft.cpp (lower = faster rise).
+//       Tuned per-band — low-frequency bands rise more slowly to avoid eating
+//       kick drums; high-frequency bands rise faster to gate EMI.
+// FALL: global FFT_FLOOR_FALL_COEFF below (~3000 frames / ~97 s to fully decay).
 #define FFT_FLOOR_FALL_COEFF  0.9997f // weight on old value when falling (slow)
  
 // ── Safety margin applied to the boot-measured peak ──────────────────────────
@@ -67,6 +67,14 @@ extern float bandMagnitude[NUM_BANDS];
 extern float bandRaw[NUM_BANDS];
 // Per-band trust flag — 0 if band is too noisy for reliable use, 1 if trusted
 extern const uint8_t BAND_TRUSTED[NUM_BANDS];
+
+extern float runtimeFloor[NUM_BANDS];
+extern float runtimeSensitivity[NUM_BANDS];
+void fftResetFloors();
+void fftResetSens();
+float fftFactoryFloor(int b);  // returns the static NOISE_FLOOR_STATIC[b]
+void fftSaveToNVS();           // persist runtimeFloor[] + runtimeSensitivity[] to NVS
+void fftLoadFromNVS();         // load from NVS; no-op if nothing saved yet
 
 void fftInit();
 // Run FFT on audioProcessBuffer, populate bandMagnitude[], clear audioBufferReady

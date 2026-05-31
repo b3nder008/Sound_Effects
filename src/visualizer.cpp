@@ -21,8 +21,9 @@
  * that mode. MODE_SPECTRUM uses them for a brightness flash.
  * Ambient modes use them to modulate sparking rate, speed, colour shift, etc.
  *
- * Only the render function selected by ACTIVE_MODE is compiled.
- * All others are compiled out entirely by #if / #elif chains.
+ * All 30 render functions are always compiled. Mode switching is entirely
+ * runtime via switch(_runtimeMode) in visualizerUpdate() — no recompile needed.
+ * ACTIVE_MODE in visualizer.h sets only the boot-time default.
  */
 
 #include "visualizer.h"

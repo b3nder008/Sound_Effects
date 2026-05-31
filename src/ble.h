@@ -17,14 +17,19 @@
  *   Characteristic   UUID suffix   Props          Format   Range
  *   ───────────────────────────────────────────────────────────────────────
  *   Power            …-0001        R/W/Notify     uint8    0=off  1=on
- *   Mode             …-0002        R/W/Notify     uint8    0–28 (MODE_xxx)
+ *   Mode             …-0002        R/W/Notify     uint8    0–29 (MODE_xxx)
  *   Brightness       …-0003        R/W/Notify     uint8    0–255
  *   Status           …-0004        R/Notify       3 bytes  [power, mode, bri]
+ *   Telemetry        …-0005        Notify         16 bytes bandRaw[8] uint16 BE
+ *   Command          …-0006        Write-NR       1 byte   cal commands
+ *   CalParams        …-0007        R/Write-NR     32 bytes floors + sens
+ *
+ * Characteristics 0005–0007 are present only when BLE_CALIBRATION_ENABLED 1
+ * in ble_cal.h.  See ble_cal.h for full calibration protocol description.
  *
  * Write any writable characteristic to change state immediately.
- * All characteristics support Notify — subscribe to Status (0004) to receive
- * the full [power, mode, brightness] state whenever anything changes,
- * including changes made by the physical buttons.
+ * Subscribe to Status (0004) to receive the full [power, mode, brightness]
+ * state whenever anything changes, including physical button presses.
  *
  * ── Device name ────────────────────────────────────────────────────────────
  *

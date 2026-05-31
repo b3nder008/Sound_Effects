@@ -1,6 +1,8 @@
 #include "fft.h"
 #include "audio.h"
+#include "ble_cal.h"
 #include <arduinoFFT.h>
+#include <Preferences.h>
  
 // ─── FFT Buffers ──────────────────────────────────────────────────────────────
 // arduinoFFT v2.x: class is now a template named ArduinoFFT<T>.
@@ -81,6 +83,8 @@ static const float SENSITIVITY[NUM_BANDS] = {
     4.000f,  // B7  air        — at cap; near Nyquist; tune by ear
 };
 
+float runtimeFloor[NUM_BANDS];
+float runtimeSensitivity[NUM_BANDS];
 // ─── Per-band adaptive floor minimum ─────────────────────────────────────────
 // Clamps adaptedFloor[] so it never collapses below measured ambient.
 // Values ≈ half of R3 p95 per band.
@@ -140,6 +144,45 @@ const uint8_t BAND_TRUSTED[NUM_BANDS] = {
     1,  // B7  air
 };
  
+void fftResetFloors() {
+    for (int b = 0; b < NUM_BANDS; b++)
+        runtimeFloor[b] = NOISE_FLOOR_STATIC[b];
+}
+ 
+void fftResetSens() {
+    for (int b = 0; b < NUM_BANDS; b++)
+        runtimeSensitivity[b] = SENSITIVITY[b];
+}
+ 
+
+float fftFactoryFloor(int b) { return NOISE_FLOOR_STATIC[b]; }
+
+// ─── NVS persistence ──────────────────────────────────────────────────────────
+// Namespace "ledcal" stores two blobs: "floors" (8 floats) and "sens" (8 floats).
+// Writes are only triggered by explicit user calibration actions, not in the loop.
+static const char* _NVS_NS     = "ledcal";
+static const char* _NVS_FLOORS = "floors";
+static const char* _NVS_SENS   = "sens";
+
+void fftSaveToNVS() {
+    Preferences p;
+    if (!p.begin(_NVS_NS, /*readOnly=*/false)) return;
+    p.putBytes(_NVS_FLOORS, runtimeFloor,       sizeof(runtimeFloor));
+    p.putBytes(_NVS_SENS,   runtimeSensitivity, sizeof(runtimeSensitivity));
+    p.end();
+}
+
+void fftLoadFromNVS() {
+    Preferences p;
+    if (!p.begin(_NVS_NS, /*readOnly=*/true)) return;
+    float tmp[NUM_BANDS];
+    if (p.getBytes(_NVS_FLOORS, tmp, sizeof(tmp)) == sizeof(tmp))
+        memcpy(runtimeFloor, tmp, sizeof(tmp));
+    if (p.getBytes(_NVS_SENS, tmp, sizeof(tmp)) == sizeof(tmp))
+        memcpy(runtimeSensitivity, tmp, sizeof(tmp));
+    p.end();
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // AUTO-CALIBRATION BLOCK
 // Everything inside this #if is compiled out when FFT_AUTO_CALIBRATE 0.
@@ -233,7 +276,10 @@ static void _runCalibration() {
  
 // ─── fftInit ──────────────────────────────────────────────────────────────────
 void fftInit() {
-#if FFT_AUTO_CALIBRATE
+    fftResetFloors();      // seed with factory constants
+    fftResetSens();
+    fftLoadFromNVS();      // override with user-saved values if present
+    #if FFT_AUTO_CALIBRATE
     // Seed adaptive floor with static values; fftCalibrate() will refine them.
     for (int b = 0; b < NUM_BANDS; b++) {
         adaptedFloor[b] = NOISE_FLOOR_STATIC[b];
@@ -305,21 +351,25 @@ void fftProcess() {
         // Only bins above the static floor contribute to the average.
         for (int k = bandBinStart[b]; k < bandBinEnd[b]; k++) {
             double mag = vReal[k];
-            if (mag > NOISE_FLOOR_STATIC[b]) {
+            if (mag > runtimeFloor[b]) {
                 sum += mag;
                 count++;
             }
         }
         float raw_s = (count > 0) ? (float)(sum / count) : 0.0f;
         bandRaw[b] = raw_s;
-        float avg = fmaxf(0.0f, raw_s - NOISE_FLOOR_STATIC[b]);
+        float avg = fmaxf(0.0f, raw_s - runtimeFloor[b]);
 #endif
  
         // ── 5. Normalise against fixed per-band scale, apply sensitivity ──────
-        float normalised = fminf(1.0f, (avg / BAND_SCALE[b]) * SENSITIVITY[b]);
+        float normalised = fminf(1.0f, (avg / BAND_SCALE[b]) * runtimeSensitivity[b]);
 
         // ── 8. Smooth output (per-band IIR low-pass) ─────────────────────────
         bandMagnitude[b] = bandMagnitude[b] * BAND_SMOOTH[b]
                          + normalised * (1.0f - BAND_SMOOTH[b]);
     }
+bleCalOnFftFrame(); 
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+

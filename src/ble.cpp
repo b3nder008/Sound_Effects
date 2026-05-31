@@ -17,7 +17,7 @@
  * STEP 1 — Install nRF Connect for Mobile
  *   App Store → search "nRF Connect for Mobile" by Nordic Semiconductor → Get
  *
- * STEP 2 — Power the ESP32-C3 and open nRF Connect
+ * STEP 2 — Power the ESP32-S3 and open nRF Connect
  *   • Tap the "Scanner" tab at the bottom
  *   • Pull to refresh — you should see "LedMatrix" appear in the list
  *   • Tap CONNECT on the LedMatrix row
@@ -25,7 +25,8 @@
  * STEP 3 — Find the service
  *   • After connecting you'll see "Client" tab with a list of services
  *   • Tap the service UUID starting with "4fafc201..."
- *   • You'll see 4 characteristics listed (0001–0004)
+ *   • You'll see 4 characteristics (0001–0004) or 7 (0001–0007) when
+ *     BLE_CALIBRATION_ENABLED 1 in ble_cal.h
  *
  * STEP 4 — Subscribe to Status notifications (characteristic 0004)
  *   • Tap the downward-arrow (subscribe/notify) icon on characteristic 0004
@@ -60,6 +61,7 @@
 #include "ble.h"
 #include "buttons.h"
 #include "visualizer.h"
+#include "ble_cal.h"
 
 #if BLE_ENABLED
 
@@ -100,11 +102,13 @@ static uint8_t _prevBrite = 150;
 class BleServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* srv) override {
         _bleConnected = true;
-        _statusDirty  = true;   // send current state to newly connected client
-    }
+        _statusDirty  = true;
+        bleCalSetConnected(true);
+}
+
     void onDisconnect(BLEServer* srv) override {
         _bleConnected = false;
-        // Restart advertising so a new connection can be made
+        bleCalSetConnected(false);
         BLEDevice::startAdvertising();
     }
 };
@@ -161,7 +165,7 @@ void bleInit() {
     _bleServer = BLEDevice::createServer();
     _bleServer->setCallbacks(new BleServerCallbacks());
 
-    BLEService* svc = _bleServer->createService(BLE_SERVICE_UUID);
+    BLEService* svc = _bleServer->createService(BLEUUID(std::string(BLE_SERVICE_UUID)), 24);
 
     // Power characteristic — R/W/Notify
     _charPower = svc->createCharacteristic(
@@ -205,7 +209,8 @@ void bleInit() {
     uint8_t sv[3] = { 1, (uint8_t)buttonsCurrentMode(), buttonsBrightness() };
     _charStatus->setValue(sv, 3);
 
-    svc->start();
+    bleCalInit(svc);   // register calibration characteristics (no-op when disabled)
+ svc->start();
 
     BLEAdvertising* adv = BLEDevice::getAdvertising();
     adv->addServiceUUID(BLE_SERVICE_UUID);
@@ -257,7 +262,9 @@ void bleUpdate() {
     if (_statusDirty && _bleConnected) {
         _statusDirty = false;
         _bleSendStatus();
-    }
+}
+    bleCalUpdate();   // process pending cal commands (no-op when disabled)
+
 }
 
 // ── Stubs when BLE disabled ───────────────────────────────────────────────────
@@ -267,3 +274,6 @@ void bleInit()   {}
 void bleUpdate() {}
 
 #endif // BLE_ENABLED
+
+// ─────────────────────────────────────────────────────────────────────────────
+
